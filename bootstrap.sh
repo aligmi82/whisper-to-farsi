@@ -291,7 +291,7 @@ class Prefs(context: Context) {
     companion object {
         const val GROQ_URL = "https://api.groq.com/openai/v1"
         const val STT_MODEL = "whisper-large-v3"
-        const val CHAT_MODEL = "llama-3.3-70b-versatile"
+        const val CHAT_MODEL = "openai/gpt-oss-120b"
     }
 }
 
@@ -709,7 +709,9 @@ import androidx.media3.transformer.Effects
 import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.Transformer
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
@@ -732,7 +734,12 @@ object AudioExtractor {
     const val TARGET_SAMPLE_RATE = 16_000
     const val TARGET_CHANNELS = 1
 
+    // Transformer فقط روی رشته‌ای با Looper (رشتهٔ اصلی) قابل ساخت و اجراست، وگرنه با
+    // IllegalStateException("Transformer is accessed on the wrong thread") کرش می‌کند.
+    // ProcessingService این تابع را از Dispatchers.Default صدا می‌زند، پس اینجا صریحاً
+    // به رشتهٔ اصلی سوییچ می‌کنیم.
     suspend fun extractMonoWav16k(context: Context, inputUri: Uri, outFile: File): File =
+        withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
             val wavSink = WavSinkAudioProcessor(outFile, TARGET_SAMPLE_RATE)
             val downmix = ChannelMixingAudioProcessor()
@@ -780,6 +787,7 @@ object AudioExtractor {
                 runCatching { transformer.cancel() }
                 wavSink.abort()
             }
+        }
         }
 }
 
