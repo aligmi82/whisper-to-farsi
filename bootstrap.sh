@@ -1024,18 +1024,59 @@ data class SubtitleLine(val startMs: Long, val endMs: Long, val sourceText: Stri
  * segmentهای خام ویسپر (که بر اساس مکث طبیعی گفتار جدا می‌شوند، نه لزوماً پایان جمله) را
  * بر اساس علائم پایان جمله ادغام می‌کند تا واحدهای ترجمه، جمله‌های کامل باشند
  * (بند ۳.۵ سند مهاجرت).
+ *
+ * قبلاً یک segment خام که خودش چند جملهٔ کامل داشت (یا با علامت پایان جمله تمام نمی‌شد)
+ * می‌توانست باعث شود چند جمله تا ۱۲ ثانیه یا ۲۲۰ کاراکتر روی هم در یک خط زیرنویس جمع شوند.
+ * حالا: ۱) هر segment ابتدا بر اساس علائم پایان جمله به واحدهای کوچک‌تر شکسته می‌شود،
+ * ۲) مکث محسوس بین دو segment هم به‌تنهایی باعث شکستن خط می‌شود، و
+ * ۳) سقف زمان/طول هر زیرنویس پایین‌تر آمده تا یک زیرنویس هیچ‌وقت خیلی طولانی روی صفحه نماند.
  */
 object SegmentMerger {
 
     private val SENTENCE_END = Regex("[.!?…؟]\\s*$")
-    private const val MAX_MERGE_MS = 12_000L
-    private const val MAX_MERGE_CHARS = 220
+    // حداکثر مدتی که یک زیرنویس روی صفحه می‌ماند و حداکثر طول متنش، حتی وقتی به علامت
+    // پایان جمله نرسیده‌ایم (استاندارد رایج زیرنویس: چند ثانیه، نه ده‌ها ثانیه)
+    private const val MAX_MERGE_MS = 6_000L
+    private const val MAX_MERGE_CHARS = 140
+
+    // مکثی به این اندازه بین دو segment یعنی گویا جملهٔ جدیدی شروع شده، حتی اگر
+    // segment قبلی با علامت پایان جمله تمام نشده باشد
+    private const val PAUSE_BREAK_MS = 600L
+
+    private val SENTENCE_SPLIT = Regex("[^.!?…؟]+[.!?…؟]*")
+
+    /** اگر متن یک segment خودش چند جملهٔ کامل داشته باشد، اینجا با زمان‌بندی متناسب با طول هر تکه شکسته می‌شود. */
+    private fun splitIntoSentenceParts(seg: SttClient.RawSegment): List<SttClient.RawSegment> {
+        val text = seg.text.trim()
+        if (text.isEmpty()) return emptyList()
+
+        val parts = SENTENCE_SPLIT.findAll(text).map { it.value.trim() }.filter { it.isNotEmpty() }.toList()
+        if (parts.size <= 1) return listOf(seg)
+
+        val totalChars = parts.sumOf { it.length }.coerceAtLeast(1)
+        val totalSec = (seg.endSec - seg.startSec).coerceAtLeast(0.0)
+        var cursor = seg.startSec
+        val out = ArrayList<SttClient.RawSegment>(parts.size)
+        parts.forEachIndexed { i, part ->
+            val end = if (i == parts.size - 1) {
+                seg.endSec
+            } else {
+                (cursor + totalSec * part.length / totalChars).coerceAtMost(seg.endSec)
+            }
+            out.add(SttClient.RawSegment(cursor, end, part))
+            cursor = end
+        }
+        return out
+    }
 
     fun merge(segments: List<SttClient.RawSegment>): List<SubtitleLine> {
+        val expanded = segments.flatMap { splitIntoSentenceParts(it) }
+
         val out = ArrayList<SubtitleLine>()
         var bufStart = -1L
         var bufEnd = -1L
         val bufText = StringBuilder()
+        var prevEndMs = -1L
 
         fun flush() {
             if (bufText.isNotBlank()) {
@@ -1044,18 +1085,24 @@ object SegmentMerger {
             bufStart = -1L
             bufEnd = -1L
             bufText.clear()
+            prevEndMs = -1L
         }
 
-        for (seg in segments) {
+        for (seg in expanded) {
             val text = seg.text.trim()
             if (text.isEmpty()) continue
             val startMs = (seg.startSec * 1000).toLong()
             val endMs = (seg.endSec * 1000).toLong()
 
+            if (bufText.isNotEmpty() && prevEndMs >= 0 && (startMs - prevEndMs) > PAUSE_BREAK_MS) {
+                flush()
+            }
+
             if (bufStart < 0) bufStart = startMs
             if (bufText.isNotEmpty()) bufText.append(' ')
             bufText.append(text)
             bufEnd = endMs
+            prevEndMs = endMs
 
             val tooLong = (bufEnd - bufStart) > MAX_MERGE_MS || bufText.length > MAX_MERGE_CHARS
             if (SENTENCE_END.containsMatchIn(text) || tooLong) flush()
@@ -1074,6 +1121,31 @@ import java.util.Locale
 
 data class TranslatedLine(val startMs: Long, val endMs: Long, val text: String)
 
+/**
+ * چون خط‌های ترجمه‌شده ممکن است اسم خاص، عدد یا کلمهٔ انگلیسی وسط جملهٔ فارسی داشته باشند،
+ * بدون علامت‌گذاری جهت، پخش‌کننده‌های ویدیو بر اساس اولین کاراکتر قوی متن، جهت پاراگراف را
+ * حدس می‌زنند و اگر آن کاراکتر لاتین/عدد باشد، کل خط را چپ‌به‌راست فرض می‌کنند و ترتیب
+ * کلمه‌های فارسی به‌هم می‌ریزد. اینجا با یک علامت RTL در ابتدای خط، جهت پاراگراف را صریحاً
+ * راست‌به‌چپ می‌کنیم و تکه‌های لاتین/عددی را با ایزوله‌کنندهٔ دوطرفه (LRI/PDI) محصور می‌کنیم
+ * تا به‌صورت یک جزیرهٔ چپ‌به‌راست، در جای درستش داخل جملهٔ فارسی نمایش داده شوند.
+ */
+object Bidi {
+
+    private const val RLM = "\u200F"
+    private const val LRI = "\u2066"
+    private const val PDI = "\u2069"
+
+    // یک یا چند «کلمهٔ» لاتین/عددی که با فاصله یا نویسه‌های رایج (./:@_-) به هم چسبیده‌اند،
+    // به‌عنوان یک جزیرهٔ چپ‌به‌راست واحد در نظر گرفته می‌شود
+    private val LATIN_RUN = Regex("[A-Za-z0-9][A-Za-z0-9 .,:/_@#&+%\\-]*[A-Za-z0-9]|[A-Za-z0-9]")
+
+    fun forRtlDisplay(text: String): String {
+        if (text.isBlank()) return text
+        val isolated = LATIN_RUN.replace(text) { m -> LRI + m.value + PDI }
+        return RLM + isolated
+    }
+}
+
 /** تبدیل خط‌های ترجمه‌شده + timestamp به متن استاندارد SRT (بند ۳.۷ سند مهاجرت). */
 object SrtBuilder {
 
@@ -1086,7 +1158,7 @@ object SrtBuilder {
             if (text.isEmpty() || text == "-") continue
             sb.append(n).append('\n')
             sb.append(ts(line.startMs)).append(" --> ").append(ts(line.endMs)).append('\n')
-            sb.append(text).append('\n').append('\n')
+            sb.append(Bidi.forRtlDisplay(text)).append('\n').append('\n')
             n++
         }
         return sb.toString()
