@@ -702,6 +702,7 @@ import android.net.Uri
 import androidx.media3.common.MediaItem
 import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.common.audio.ChannelMixingAudioProcessor
+import androidx.media3.common.audio.ChannelMixingMatrix
 import androidx.media3.common.audio.SonicAudioProcessor
 import androidx.media3.transformer.Composition
 import androidx.media3.transformer.EditedMediaItem
@@ -742,7 +743,14 @@ object AudioExtractor {
         withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
             val wavSink = WavSinkAudioProcessor(outFile, TARGET_SAMPLE_RATE)
-            val downmix = ChannelMixingAudioProcessor()
+            // ChannelMixingAudioProcessor پیش از استفاده باید برای هر تعداد کانال ورودی
+            // محتمل (مونو یا استریو که اکثر ویدیوها هستند) یک ماتریس تبدیل صریح داشته
+            // باشد؛ وگرنه Transformer با «error while registering input» روی فرمت‌های
+            // رایج (مثلاً ۴۴۱۰۰Hz استریو) شکست می‌خورد.
+            val downmix = ChannelMixingAudioProcessor().apply {
+                putChannelMixingMatrix(ChannelMixingMatrix.create(1, TARGET_CHANNELS))
+                putChannelMixingMatrix(ChannelMixingMatrix.create(2, TARGET_CHANNELS))
+            }
             val resample = SonicAudioProcessor().apply {
                 setOutputSampleRateHz(TARGET_SAMPLE_RATE)
             }
