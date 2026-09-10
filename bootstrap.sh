@@ -102,10 +102,12 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 
-    // استخراج صدا از فایل ویدیو/صوت ورودی (بند ۳.۲ سند مهاجرت)
-    implementation("androidx.media3:media3-transformer:1.4.1")
+    // استخراج صدا از فایل ویدیو/صوت ورودی: مستقیم با MediaExtractor/MediaCodec پلتفرم
+    // (بند ۳.۲ سند مهاجرت). فقط media3-common لازم است، چون ChannelMixingAudioProcessor
+    // و SonicAudioProcessor از همان پکیج استفاده می‌شوند؛ دیگر نیازی به media3-transformer
+    // یا media3-effect (و در نتیجه Muxer داخلی آن‌ها) نیست — همان چیزی که خطای
+    // «Muxer error» از آن می‌آمد.
     implementation("androidx.media3:media3-common:1.4.1")
-    implementation("androidx.media3:media3-effect:1.4.1")
 }
 EOF_APP
 
@@ -698,179 +700,222 @@ cat > app/src/main/java/ir/livesub/AudioExtractor.kt <<'EOF_EXTRACTOR'
 package ir.livesub
 
 import android.content.Context
+import android.media.MediaCodec
+import android.media.MediaExtractor
+import android.media.MediaFormat
 import android.net.Uri
-import androidx.media3.common.MediaItem
+import androidx.media3.common.C
 import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.common.audio.ChannelMixingAudioProcessor
 import androidx.media3.common.audio.ChannelMixingMatrix
 import androidx.media3.common.audio.SonicAudioProcessor
-import androidx.media3.transformer.Composition
-import androidx.media3.transformer.EditedMediaItem
-import androidx.media3.transformer.Effects
-import androidx.media3.transformer.ExportException
-import androidx.media3.transformer.ExportResult
-import androidx.media3.transformer.Transformer
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
 /**
- * استخراج صدای مونو ۱۶kHz از فایل ویدیو/صوت ورودی با androidx.media3:media3-transformer
- * (بند ۳.۲ سند مهاجرت). downmix و resample داخل پایپ‌لاین رسمی Transformer با AudioProcessor
- * انجام می‌شود، نه با تبدیل دستی؛ نتیجه از طریق یک AudioProcessor پایانی مستقیماً به‌صورت WAV
- * استاندارد روی دیسک نوشته می‌شود تا نیازی به MediaExtractor/MediaCodec خام یا FFmpeg نباشد.
+ * استخراج صدای مونو ۱۶kHz از فایل ویدیو/صوت ورودی (بند ۳.۲ سند مهاجرت).
  *
- * نکته: سطح دقیق API کلاس‌های media3-transformer/media3-common بین نسخه‌ها تغییر می‌کند.
- * این پیاده‌سازی باید پیش از build نهایی در برابر نسخهٔ Media3 پین‌شده در app/build.gradle.kts
- * کامپایل و آزمایش شود.
+ * نسخهٔ قبلی این کلاس از androidx.media3:media3-transformer برای export به یک فایل MP4
+ * «دورریختنی» استفاده می‌کرد و هم‌زمان با یک AudioProcessor واسط، PCM را مستقیم در یک WAV
+ * می‌نوشت. مشکل این بود که خروجی واقعی WAV بود ولی Transformer همچنان مجبور بود صدا را
+ * برای همان فایل دورریختنی انکود/مالتی‌پلکس کند؛ روی برخی فایل‌های ورودی این مرحلهٔ
+ * بی‌ربط با «Muxer error» (ExportException از InAppMp4Muxer داخلی Transformer) شکست
+ * می‌خورد.
+ *
+ * این نسخه اصلاح‌شده اصلاً به Transformer/Muxer نیازی ندارد: مستقیماً با
+ * android.media.MediaExtractor ترک صوتی فایل ورودی خوانده و با android.media.MediaCodec
+ * دیکد می‌شود؛ downmix و resample همچنان با همان AudioProcessorهای رسمی Media3
+ * (ChannelMixingAudioProcessor و SonicAudioProcessor، که در media3-common هستند و
+ * نیازی به ماژول transformer ندارند) انجام می‌شود و نتیجه مستقیم در یک WAV مونو
+ * ۱۶بیتی نوشته می‌شود. چون هیچ Muxer‌ای در مسیر نیست، آن کلاس خطا از ریشه حذف شده.
  */
 object AudioExtractor {
 
     const val TARGET_SAMPLE_RATE = 16_000
     const val TARGET_CHANNELS = 1
 
-    // Transformer فقط روی رشته‌ای با Looper (رشتهٔ اصلی) قابل ساخت و اجراست، وگرنه با
-    // IllegalStateException("Transformer is accessed on the wrong thread") کرش می‌کند.
-    // ProcessingService این تابع را از Dispatchers.Default صدا می‌زند، پس اینجا صریحاً
-    // به رشتهٔ اصلی سوییچ می‌کنیم.
     suspend fun extractMonoWav16k(context: Context, inputUri: Uri, outFile: File): File =
-        withContext(Dispatchers.Main) {
-        suspendCancellableCoroutine { cont ->
-            val wavSink = WavSinkAudioProcessor(outFile, TARGET_SAMPLE_RATE)
-            // ChannelMixingAudioProcessor پیش از استفاده باید برای هر تعداد کانال ورودی
-            // محتمل (مونو یا استریو که اکثر ویدیوها هستند) یک ماتریس تبدیل صریح داشته
-            // باشد؛ وگرنه Transformer با «error while registering input» روی فرمت‌های
-            // رایج (مثلاً ۴۴۱۰۰Hz استریو) شکست می‌خورد.
-            val downmix = ChannelMixingAudioProcessor().apply {
-                putChannelMixingMatrix(ChannelMixingMatrix.create(1, TARGET_CHANNELS))
-                putChannelMixingMatrix(ChannelMixingMatrix.create(2, TARGET_CHANNELS))
-            }
-            val resample = SonicAudioProcessor().apply {
-                setOutputSampleRateHz(TARGET_SAMPLE_RATE)
-            }
+        withContext(Dispatchers.IO) {
+            val extractor = MediaExtractor()
+            var decoder: MediaCodec? = null
+            var raf: RandomAccessFile? = null
+            var success = false
+            try {
+                extractor.setDataSource(context, inputUri, null)
 
-            val editedItem = EditedMediaItem.Builder(MediaItem.fromUri(inputUri))
-                .setRemoveVideo(true)
-                .setEffects(
-                    Effects(
-                        /* audioProcessors= */ listOf(downmix, resample, wavSink),
-                        /* videoEffects= */ emptyList(),
-                    )
-                )
-                .build()
+                var trackIndex = -1
+                var trackFormat: MediaFormat? = null
+                for (i in 0 until extractor.trackCount) {
+                    val f = extractor.getTrackFormat(i)
+                    val mime = f.getString(MediaFormat.KEY_MIME)
+                    if (mime != null && mime.startsWith("audio/")) {
+                        trackIndex = i
+                        trackFormat = f
+                        break
+                    }
+                }
+                val fmt = trackFormat
+                    ?: throw IllegalStateException("هیچ ترک صوتی در فایل ورودی پیدا نشد")
+                extractor.selectTrack(trackIndex)
 
-            // Transformer همیشه یک خروجی کانتینر می‌سازد؛ چون خروجی واقعی ما WAV نوشته‌شده
-            // توسط wavSink است، این فایل فقط یک ظرف دورریختنی است.
-            val throwAway = File(context.cacheDir, "transform_tmp_" + System.currentTimeMillis() + ".mp4")
+                val mime = fmt.getString(MediaFormat.KEY_MIME)!!
+                val codec = MediaCodec.createDecoderByType(mime)
+                codec.configure(fmt, null, null, 0)
+                codec.start()
+                decoder = codec
 
-            val transformer = Transformer.Builder(context)
-                .addListener(object : Transformer.Listener {
-                    override fun onCompleted(composition: Composition, result: ExportResult) {
-                        wavSink.finish()
-                        throwAway.delete()
-                        if (cont.isActive) cont.resume(outFile)
+                val f = RandomAccessFile(outFile, "rw")
+                f.setLength(0)
+                f.write(ByteArray(44)) // جای هدر؛ در پایان با اندازهٔ واقعی جایگزین می‌شود
+                raf = f
+
+                // مقدار اولیه از فرمت ترک؛ اگر دیکودر در INFO_OUTPUT_FORMAT_CHANGED مقدار
+                // دقیق‌تری بدهد (که معمولاً می‌دهد)، جایگزین می‌شود.
+                var sampleRate = if (fmt.containsKey(MediaFormat.KEY_SAMPLE_RATE))
+                    fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE) else TARGET_SAMPLE_RATE
+                var channelCount = if (fmt.containsKey(MediaFormat.KEY_CHANNEL_COUNT))
+                    fmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT) else 1
+
+                var downmix: ChannelMixingAudioProcessor? = null
+                var resample: SonicAudioProcessor? = null
+                var dataBytesWritten = 0L
+
+                fun buildProcessors(rate: Int, channels: Int): Pair<ChannelMixingAudioProcessor, SonicAudioProcessor> {
+                    val dm = ChannelMixingAudioProcessor().apply {
+                        putChannelMixingMatrix(ChannelMixingMatrix.create(1, TARGET_CHANNELS))
+                        putChannelMixingMatrix(ChannelMixingMatrix.create(2, TARGET_CHANNELS))
+                        if (channels > 2) {
+                            // پوشش فایل‌های چندکاناله (مثلاً ۵.۱)؛ به مونو خلاصه می‌شود
+                            putChannelMixingMatrix(ChannelMixingMatrix.create(channels, TARGET_CHANNELS))
+                        }
+                    }
+                    val sm = SonicAudioProcessor().apply {
+                        setOutputSampleRateHz(TARGET_SAMPLE_RATE)
+                    }
+                    val inFormat = AudioProcessor.AudioFormat(rate, channels, C.ENCODING_PCM_16BIT)
+                    val midFormat = dm.configure(inFormat)
+                    sm.configure(midFormat)
+                    dm.flush()
+                    sm.flush()
+                    return dm to sm
+                }
+
+                fun ensureProcessors() {
+                    if (downmix == null) {
+                        val (dm, sm) = buildProcessors(sampleRate, channelCount)
+                        downmix = dm
+                        resample = sm
+                    }
+                }
+
+                // یک بافر ByteBuffer را کامل از یک AudioProcessor عبور می‌دهد و خروجی را
+                // به‌صورت ByteBuffer تازه برمی‌گرداند (یا اگر processor غیرفعال بود، همان
+                // ورودی بدون تغییر رد می‌شود).
+                fun drain(processor: AudioProcessor, input: ByteBuffer, endOfStream: Boolean): ByteBuffer {
+                    if (!processor.isActive) return input
+                    if (input.hasRemaining()) processor.queueInput(input)
+                    if (endOfStream) processor.queueEndOfStream()
+                    val collected = ByteArrayOutputStream()
+                    while (true) {
+                        val out = processor.output
+                        if (!out.hasRemaining()) break
+                        val chunk = ByteArray(out.remaining())
+                        out.get(chunk)
+                        collected.write(chunk)
+                    }
+                    val bytes = collected.toByteArray()
+                    return ByteBuffer.wrap(bytes).order(ByteOrder.nativeOrder())
+                }
+
+                fun writePcm(buf: ByteBuffer, endOfStream: Boolean) {
+                    ensureProcessors()
+                    val afterDownmix = drain(downmix!!, buf, endOfStream)
+                    val afterResample = drain(resample!!, afterDownmix, endOfStream)
+                    if (afterResample.hasRemaining()) {
+                        val n = afterResample.remaining()
+                        val bytes = ByteArray(n)
+                        afterResample.get(bytes)
+                        raf!!.write(bytes)
+                        dataBytesWritten += n
+                    }
+                }
+
+                val bufferInfo = MediaCodec.BufferInfo()
+                var inputDone = false
+                var outputDone = false
+                val timeoutUs = 10_000L
+
+                while (!outputDone) {
+                    currentCoroutineContext().ensureActive()
+
+                    if (!inputDone) {
+                        val inIndex = codec.dequeueInputBuffer(timeoutUs)
+                        if (inIndex >= 0) {
+                            val inBuf = codec.getInputBuffer(inIndex)!!
+                            val sampleSize = extractor.readSampleData(inBuf, 0)
+                            if (sampleSize < 0) {
+                                codec.queueInputBuffer(
+                                    inIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM,
+                                )
+                                inputDone = true
+                            } else {
+                                codec.queueInputBuffer(
+                                    inIndex, 0, sampleSize, extractor.sampleTime, 0,
+                                )
+                                extractor.advance()
+                            }
+                        }
                     }
 
-                    override fun onError(
-                        composition: Composition,
-                        result: ExportResult,
-                        exception: ExportException,
-                    ) {
-                        wavSink.abort()
-                        throwAway.delete()
-                        if (cont.isActive) cont.resumeWithException(exception)
+                    val outIndex = codec.dequeueOutputBuffer(bufferInfo, timeoutUs)
+                    when {
+                        outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                            val newFormat = codec.outputFormat
+                            if (downmix == null) {
+                                if (newFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                                    sampleRate = newFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                                }
+                                if (newFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                                    channelCount = newFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                                }
+                            }
+                        }
+                        outIndex >= 0 -> {
+                            val isEos = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+                            if (bufferInfo.size > 0) {
+                                val outBuf = codec.getOutputBuffer(outIndex)!!
+                                outBuf.position(bufferInfo.offset)
+                                outBuf.limit(bufferInfo.offset + bufferInfo.size)
+                                writePcm(outBuf, isEos)
+                            } else if (isEos) {
+                                writePcm(ByteBuffer.allocate(0), true)
+                            }
+                            codec.releaseOutputBuffer(outIndex, false)
+                            if (isEos) outputDone = true
+                        }
                     }
-                })
-                .build()
+                }
 
-            transformer.start(editedItem, throwAway.absolutePath)
-
-            cont.invokeOnCancellation {
-                runCatching { transformer.cancel() }
-                wavSink.abort()
+                writeHeader(raf!!, dataBytesWritten, TARGET_SAMPLE_RATE)
+                success = true
+                outFile
+            } finally {
+                runCatching { decoder?.stop() }
+                runCatching { decoder?.release() }
+                runCatching { extractor.release() }
+                runCatching { raf?.close() }
+                if (!success) runCatching { outFile.delete() }
             }
         }
-        }
-}
 
-/**
- * AudioProcessor پایانی زنجیره: بافر PCM عبوری را بدون تغییر رد می‌کند (تا Transformer
- * بتواند پایپ‌لاین را عادی به پایان برساند) و هم‌زمان یک نسخه از آن را در یک فایل WAV
- * استاندارد ۱۶بیتی مونو می‌نویسد.
- */
-private class WavSinkAudioProcessor(
-    private val outFile: File,
-    private val sampleRate: Int,
-) : AudioProcessor {
-
-    private var raf: RandomAccessFile? = null
-    private var bytesWritten: Long = 0
-    private var pendingOutput: ByteBuffer = AudioProcessor.EMPTY_BUFFER
-    private var configured = false
-
-    override fun configure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
-        val f = RandomAccessFile(outFile, "rw")
-        f.setLength(0)
-        f.write(ByteArray(44)) // جای هدر؛ در پایان با اندازهٔ واقعی جایگزین می‌شود
-        raf = f
-        bytesWritten = 0
-        configured = true
-        return inputAudioFormat
-    }
-
-    override fun isActive(): Boolean = configured
-
-    override fun queueInput(inputBuffer: ByteBuffer) {
-        val remaining = inputBuffer.remaining()
-        if (remaining == 0) return
-        val bytes = ByteArray(remaining)
-        val mark = inputBuffer.position()
-        inputBuffer.get(bytes)
-        inputBuffer.position(mark)
-        raf?.write(bytes)
-        bytesWritten += bytes.size
-        pendingOutput = inputBuffer
-    }
-
-    override fun queueEndOfStream() { /* هیچ کار اضافه‌ای لازم نیست */ }
-
-    override fun getOutput(): ByteBuffer {
-        val out = pendingOutput
-        pendingOutput = AudioProcessor.EMPTY_BUFFER
-        return out
-    }
-
-    override fun isEnded(): Boolean = true
-
-    override fun flush() { /* بافر میانی نداریم */ }
-
-    override fun reset() {
-        raf?.let { runCatching { it.close() } }
-        raf = null
-        configured = false
-        pendingOutput = AudioProcessor.EMPTY_BUFFER
-    }
-
-    fun finish() {
-        val f = raf ?: return
-        writeHeader(f, bytesWritten)
-        runCatching { f.close() }
-        raf = null
-    }
-
-    fun abort() {
-        raf?.let { runCatching { it.close() } }
-        raf = null
-        runCatching { outFile.delete() }
-    }
-
-    private fun writeHeader(f: RandomAccessFile, dataSize: Long) {
+    private fun writeHeader(f: RandomAccessFile, dataSize: Long, sampleRate: Int) {
         val bb = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
         bb.put("RIFF".toByteArray(Charsets.US_ASCII))
         bb.putInt((36 + dataSize).toInt())
