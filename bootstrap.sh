@@ -302,29 +302,17 @@ class Prefs(context: Context) {
         set(v) { w("tr_tone", v) }
 
     /**
-     * کلید API جمینای (Google AI Studio)، جدا از کلید گروک. رونویسی همچنان فقط با
-     * گروک انجام می‌شود؛ این کلید فقط برای مرحلهٔ ترجمه وقتی translationProvider
-     * روی جمینای باشد استفاده می‌شود.
+     * خروجی زیرنویس: ترجمهٔ خودکار به فارسی (OUTPUT_TRANSLATE، پیش‌فرض) یا فقط زیرنویس
+     * زبان اصلی بدون ترجمه (OUTPUT_ORIGINAL) — برای وقتی کاربر می‌خواهد خودش متن را جای
+     * دیگری (مثلاً یک چت‌بات جداگانه) ترجمه کند. در حالت OUTPUT_ORIGINAL مرحلهٔ ترجمه
+     * کلاً اجرا نمی‌شود و رونویسی خام (بعد از ادغام جمله‌ها) مستقیماً به SRT تبدیل می‌شود.
      */
-    var geminiApiKey: String
-        get() = s("gem_key", "")
-        set(v) { w("gem_key", v) }
-
-    /** مدل ترجمهٔ جمینای؛ فقط از میان مدل‌هایی که فعلاً در سطح رایگان جمینای هستند (GEMINI_MODELS). */
-    var geminiModel: String
+    var outputMode: String
         get() {
-            val v = s("gem_model", GEMINI_MODEL)
-            return if (v.isBlank()) GEMINI_MODEL else v
+            val v = s("out_mode", OUTPUT_TRANSLATE)
+            return if (v.isBlank()) OUTPUT_TRANSLATE else v
         }
-        set(v) { w("gem_model", v) }
-
-    /** ارائه‌دهندهٔ مرحلهٔ ترجمه: گروک (PROVIDER_GROQ) یا جمینای (PROVIDER_GEMINI). رونویسی همیشه با گروک است. */
-    var translationProvider: String
-        get() {
-            val v = s("tr_provider", PROVIDER_GROQ)
-            return if (v.isBlank()) PROVIDER_GROQ else v
-        }
-        set(v) { w("tr_provider", v) }
+        set(v) { w("out_mode", v) }
 
     companion object {
         const val GROQ_URL = "https://api.groq.com/openai/v1"
@@ -333,33 +321,10 @@ class Prefs(context: Context) {
         const val TONE_NATURAL = "natural"
         const val TONE_FORMAL = "formal"
 
-        const val PROVIDER_GROQ = "groq"
-        const val PROVIDER_GEMINI = "gemini"
-
-        // فقط مدل ترجمهٔ متنی؛ رونویسی صدا همیشه با ویسپر روی گروک باقی می‌ماند
-        const val GEMINI_MODEL = "gemini-2.5-flash"
+        const val OUTPUT_TRANSLATE = "translate"
+        const val OUTPUT_ORIGINAL = "original"
     }
 }
-
-/**
- * فهرست مدل‌های جمینای که «فقط» برای ترجمه (Picker مدل ترجمه، وقتی ارائه‌دهنده جمینای
- * است) نمایش داده می‌شوند. عمداً محدود به مدل‌هایی شده که طبق صفحهٔ رسمی قیمت‌گذاری
- * (ai.google.dev/pricing) در حال حاضر ورودی/خروجی‌شان روی کلید رایگان Google AI Studio
- * «Free of charge» است — یعنی مدل‌های Pro-preview، image، TTS و مانند این‌ها که فقط
- * روی سطح پولی هستند عمداً حذف شده‌اند. چون این وضعیت هر چند وقت یک‌بار توسط گوگل
- * تغییر می‌کند، قبل از تکیه‌کردن روی این لیست دوباره از صفحهٔ رسمی قیمت‌گذاری چک شود.
- */
-data class GeminiModelOption(val id: String, val fa: String)
-
-val GEMINI_MODELS = listOf(
-    GeminiModelOption("gemini-2.5-pro", "Gemini 2.5 Pro (باکیفیت‌ترین، رایگان)"),
-    GeminiModelOption("gemini-3-flash-preview", "Gemini 3 Flash Preview (جدیدترین، رایگان)"),
-    GeminiModelOption("gemini-2.5-flash", "Gemini 2.5 Flash (پیش‌فرض، رایگان)"),
-    GeminiModelOption("gemini-2.5-flash-lite", "Gemini 2.5 Flash-Lite (سریع‌تر، رایگان)"),
-    GeminiModelOption("gemini-3.1-flash-lite-preview", "Gemini 3.1 Flash-Lite Preview (رایگان)"),
-    GeminiModelOption("gemini-2.0-flash", "Gemini 2.0 Flash (رایگان)"),
-    GeminiModelOption("gemini-2.0-flash-lite", "Gemini 2.0 Flash-Lite (رایگان)"),
-)
 
 // ======================================================= زبان‌ها
 
@@ -512,33 +477,6 @@ object Net {
         }
     }
 
-    /** آزمایش دستی کلید جمینای: کلید سالم است؟ مدل انتخاب‌شده برای ترجمه در دسترس است؟ */
-    suspend fun checkGeminiKey(apiKey: String, model: String): String = withContext(Dispatchers.IO) {
-        if (apiKey.isBlank()) return@withContext "اول کلید جمینای را وارد کنید"
-        try {
-            val req = Request.Builder()
-                .url(GeminiBatchTranslator.API_BASE + "/models?key=" + apiKey)
-                .build()
-            chat.newCall(req).execute().use { r ->
-                val body = r.body?.string().orEmpty()
-                if (!r.isSuccessful) {
-                    return@withContext "کلید جمینای پذیرفته نشد (کد " + r.code + "): " + body.take(120)
-                }
-                val arr: JSONArray? = JSONObject(body).optJSONArray("models")
-                val names = ArrayList<String>()
-                if (arr != null) {
-                    for (i in 0 until arr.length()) {
-                        // فرمت شناسهٔ مدل در این endpoint معمولاً "models/gemini-2.5-flash" است
-                        names.add(arr.optJSONObject(i)?.optString("name").orEmpty().removePrefix("models/"))
-                    }
-                }
-                val b = if (names.contains(model)) "موجود" else "پیدا نشد"
-                "کلید جمینای سالم است. مدل ترجمه: " + b
-            }
-        } catch (t: Throwable) {
-            "خطای شبکه: " + (t.message ?: "نامعلوم")
-        }
-    }
 }
 
 /** رونویسی با ویسپر روی گروک، خروجی segment‌دار برای ساخت SRT (بند ۳.۴ سند مهاجرت). */
@@ -628,9 +566,8 @@ class SttClient(private val http: OkHttpClient = Net.stt) {
 }
 
 /**
- * پرامپت سیستمی و پارس خروجی شماره‌گذاری‌شده بین BatchTranslator (گروک) و
- * GeminiBatchTranslator (جمینای) مشترک است، چون هر دو دقیقاً همان قرارداد
- * «یک خط شماره‌گذاری‌شده به ازای هر ورودی» را از مدل می‌خواهند.
+ * پرامپت سیستمی و پارس خروجی شماره‌گذاری‌شده که BatchTranslator (گروک) به کار می‌برد؛
+ * قرارداد «یک خط شماره‌گذاری‌شده به ازای هر ورودی» را از مدل می‌خواهد.
  */
 private object TranslationPrompt {
 
@@ -795,106 +732,6 @@ class BatchTranslator(private val http: OkHttpClient = Net.chat) {
         const val MAX_RETRIES = 6
     }
 }
-
-/**
- * ترجمهٔ دسته‌ای روی Gemini API (Google AI Studio)، با همان قرارداد BatchTranslator
- * (شماره‌گذاری خطوط، همان پرامپت سیستمی، همان منطق retry با backoff روی ۴۲۹) اما با
- * فرمت درخواست/پاسخ REST جمینای که با OpenAI-style chat/completions گروک فرق دارد:
- * کلید API به‌صورت query param است، نه هدر Authorization، و متن پاسخ زیر
- * candidates[0].content.parts[0].text می‌آید.
- */
-class GeminiBatchTranslator(private val http: OkHttpClient = Net.chat) {
-
-    data class Config(
-        val apiKey: String,
-        val model: String,
-        val temperature: Double = 0.3,
-    )
-
-    private class RateLimitedException(msg: String) : IOException(msg)
-
-    suspend fun translateBatch(
-        lines: List<String>,
-        sourceLanguageEnglish: String,
-        cfg: Config,
-        contextTail: List<String> = emptyList(),
-        tone: String = Prefs.TONE_NATURAL,
-    ): List<String> {
-        if (lines.isEmpty()) return emptyList()
-        var attempt = 0
-        var delayMs = 2_000L
-        while (true) {
-            try {
-                return doTranslate(lines, sourceLanguageEnglish, cfg, contextTail, tone)
-            } catch (rl: RateLimitedException) {
-                attempt++
-                if (attempt > MAX_RETRIES) throw rl
-                delay(delayMs)
-                delayMs = (delayMs * 2).coerceAtMost(60_000L)
-            }
-        }
-    }
-
-    private suspend fun doTranslate(
-        lines: List<String>,
-        sourceLanguageEnglish: String,
-        cfg: Config,
-        contextTail: List<String>,
-        tone: String,
-    ): List<String> = withContext(Dispatchers.IO) {
-        val numbered = TranslationPrompt.numberedLines(lines)
-        val contextBlock = TranslationPrompt.contextBlock(contextTail)
-
-        val payload = JSONObject().apply {
-            put(
-                "systemInstruction",
-                JSONObject().put(
-                    "parts",
-                    JSONArray().put(JSONObject().put("text", TranslationPrompt.systemPrompt(sourceLanguageEnglish, tone))),
-                ),
-            )
-            put(
-                "contents",
-                JSONArray().put(
-                    JSONObject()
-                        .put("role", "user")
-                        .put("parts", JSONArray().put(JSONObject().put("text", contextBlock + numbered))),
-                ),
-            )
-            put(
-                "generationConfig",
-                JSONObject()
-                    .put("temperature", cfg.temperature)
-                    .put("maxOutputTokens", 4000),
-            )
-        }
-
-        val url = API_BASE + "/models/" + cfg.model + ":generateContent?key=" + cfg.apiKey
-        val req = Request.Builder()
-            .url(url)
-            .post(payload.toString().toRequestBody(JSON))
-            .build()
-
-        val raw = http.newCall(req).execute().use { resp ->
-            val body = resp.body?.string().orEmpty()
-            if (resp.code == 429) throw RateLimitedException(body.take(200))
-            if (!resp.isSuccessful) throw IOException("Gemini " + resp.code + ": " + body.take(200))
-            runCatching {
-                JSONObject(body).getJSONArray("candidates").getJSONObject(0)
-                    .getJSONObject("content").getJSONArray("parts").getJSONObject(0)
-                    .optString("text")
-            }.getOrDefault("")
-        }
-        TranslationPrompt.parseNumbered(raw, lines.size)
-    }
-
-    companion object {
-        const val API_BASE = "https://generativelanguage.googleapis.com/v1beta"
-        private val JSON = "application/json; charset=utf-8".toMediaType()
-        private const val MAX_RETRIES = 6
-    }
-}
-
 
 // ======================================================= پاک‌سازی متن
 
@@ -1314,11 +1151,19 @@ object SegmentMerger {
     // می‌آید) این عدد قطعی جلوی چسبیدن ۳-۴ جمله به هم در یک خط را می‌گیرد.
     private const val MAX_SENTENCES_PER_LINE = 2
 
+    // حداکثر تعداد کلمه‌ای که در یک خط زیرنویس نمایش داده می‌شود — سقفی قطعی و مستقل
+    // از طول کاراکتر/تعداد جمله؛ هیچ خط زیرنویسی، حتی یک جملهٔ کوتاه‌نشدهٔ تکی، بیشتر
+    // از این تعداد کلمه نخواهد داشت.
+    private const val MAX_WORDS_PER_LINE = 10
+
     // مکثی به این اندازه بین دو segment یعنی گویا جملهٔ جدیدی شروع شده، حتی اگر
     // segment قبلی با علامت پایان جمله تمام نشده باشد
     private const val PAUSE_BREAK_MS = 600L
 
     private val SENTENCE_SPLIT = Regex("[^.!?…؟]+[.!?…؟]*")
+    private val WORD_SPLIT = Regex("\\S+")
+
+    private fun wordCount(text: String): Int = WORD_SPLIT.findAll(text).count()
 
     /** اگر متن یک segment خودش چند جملهٔ کامل داشته باشد، اینجا با زمان‌بندی متناسب با طول هر تکه شکسته می‌شود. */
     private fun splitIntoSentenceParts(seg: SttClient.RawSegment): List<SttClient.RawSegment> {
@@ -1326,19 +1171,49 @@ object SegmentMerger {
         if (text.isEmpty()) return emptyList()
 
         val parts = SENTENCE_SPLIT.findAll(text).map { it.value.trim() }.filter { it.isNotEmpty() }.toList()
-        if (parts.size <= 1) return listOf(seg)
+        val sentenceParts = if (parts.size <= 1) listOf(seg) else run {
+            val totalChars = parts.sumOf { it.length }.coerceAtLeast(1)
+            val totalSec = (seg.endSec - seg.startSec).coerceAtLeast(0.0)
+            var cursor = seg.startSec
+            val out = ArrayList<SttClient.RawSegment>(parts.size)
+            parts.forEachIndexed { i, part ->
+                val end = if (i == parts.size - 1) {
+                    seg.endSec
+                } else {
+                    (cursor + totalSec * part.length / totalChars).coerceAtMost(seg.endSec)
+                }
+                out.add(SttClient.RawSegment(cursor, end, part))
+                cursor = end
+            }
+            out
+        }
 
-        val totalChars = parts.sumOf { it.length }.coerceAtLeast(1)
+        // حتی یک «جملهٔ» تکی هم ممکن است بیشتر از سقف کلمه باشد (مثلاً دیالوگ طولانی بی‌علامت)؛
+        // اینجا هر تکه‌ای که از سقف کلمه رد شده باشد، به قطعات حداکثر MAX_WORDS_PER_LINE کلمه‌ای
+        // شکسته می‌شود، با زمان‌بندی متناسب با تعداد کلمهٔ هر قطعه.
+        return sentenceParts.flatMap { splitByWordLimit(it) }
+    }
+
+    private fun splitByWordLimit(seg: SttClient.RawSegment): List<SttClient.RawSegment> {
+        val text = seg.text.trim()
+        if (text.isEmpty()) return emptyList()
+        val words = WORD_SPLIT.findAll(text).map { it.value }.toList()
+        if (words.size <= MAX_WORDS_PER_LINE) return listOf(seg)
+
+        val chunks = words.chunked(MAX_WORDS_PER_LINE)
+        val totalWords = words.size
         val totalSec = (seg.endSec - seg.startSec).coerceAtLeast(0.0)
         var cursor = seg.startSec
-        val out = ArrayList<SttClient.RawSegment>(parts.size)
-        parts.forEachIndexed { i, part ->
-            val end = if (i == parts.size - 1) {
+        var wordsDone = 0
+        val out = ArrayList<SttClient.RawSegment>(chunks.size)
+        chunks.forEachIndexed { i, chunk ->
+            wordsDone += chunk.size
+            val end = if (i == chunks.size - 1) {
                 seg.endSec
             } else {
-                (cursor + totalSec * part.length / totalChars).coerceAtMost(seg.endSec)
+                (seg.startSec + totalSec * wordsDone / totalWords).coerceAtMost(seg.endSec)
             }
-            out.add(SttClient.RawSegment(cursor, end, part))
+            out.add(SttClient.RawSegment(cursor, end, chunk.joinToString(" ")))
             cursor = end
         }
         return out
@@ -1353,6 +1228,7 @@ object SegmentMerger {
         val bufText = StringBuilder()
         var prevEndMs = -1L
         var bufParts = 0
+        var bufWords = 0
 
         fun flush() {
             if (bufText.isNotBlank()) {
@@ -1363,6 +1239,7 @@ object SegmentMerger {
             bufText.clear()
             prevEndMs = -1L
             bufParts = 0
+            bufWords = 0
         }
 
         for (seg in expanded) {
@@ -1370,8 +1247,14 @@ object SegmentMerger {
             if (text.isEmpty()) continue
             val startMs = (seg.startSec * 1000).toLong()
             val endMs = (seg.endSec * 1000).toLong()
+            val segWords = wordCount(text)
 
             if (bufText.isNotEmpty() && prevEndMs >= 0 && (startMs - prevEndMs) > PAUSE_BREAK_MS) {
+                flush()
+            }
+            // اگر افزودن این تکه به بافر فعلی از سقف کلمه رد شود، اول بافر را می‌بندیم
+            // تا خود این تکه (که خودش حداکثر MAX_WORDS_PER_LINE کلمه دارد) خط بعدی را شروع کند.
+            if (bufText.isNotEmpty() && bufWords + segWords > MAX_WORDS_PER_LINE) {
                 flush()
             }
 
@@ -1381,12 +1264,14 @@ object SegmentMerger {
             bufEnd = endMs
             prevEndMs = endMs
             bufParts++
+            bufWords += segWords
 
             val tooLong = (bufEnd - bufStart) > MAX_MERGE_MS || bufText.length > MAX_MERGE_CHARS
+            val tooManyWords = bufWords >= MAX_WORDS_PER_LINE
             val endsSentence = SENTENCE_END.containsMatchIn(text)
             // پس از رسیدن به سقف جمله‌ها، حتی اگر segment فعلی خودش با علامت پایان جمله
             // تمام نشده باشد (مثلاً در دیالوگ بی‌علامت)، همین‌جا خط را می‌بندیم.
-            if (endsSentence || tooLong || bufParts >= MAX_SENTENCES_PER_LINE) flush()
+            if (endsSentence || tooLong || tooManyWords || bufParts >= MAX_SENTENCES_PER_LINE) flush()
         }
         flush()
         return out
@@ -1441,7 +1326,13 @@ object Bidi {
 /** تبدیل خط‌های ترجمه‌شده + timestamp به متن استاندارد SRT (بند ۳.۷ سند مهاجرت). */
 object SrtBuilder {
 
-    fun build(lines: List<TranslatedLine>): String {
+    /**
+     * applyPersianBidi=true (پیش‌فرض) برای متن ترجمه‌شدهٔ فارسی، که ایزوله‌سازی جهت لازم
+     * دارد. برای زیرنویس زبان اصلی (بدون ترجمه) applyPersianBidi=false پاس داده می‌شود،
+     * چون متن مبدأ ممکن است خودش فارسی نباشد و علامت‌گذاری RTL اجباری برایش نادرست است؛
+     * جهت نمایش را در آن حالت خود پخش‌کننده بر اساس محتوای متن تشخیص می‌دهد.
+     */
+    fun build(lines: List<TranslatedLine>, applyPersianBidi: Boolean = true): String {
         val sb = StringBuilder()
         var n = 1
         for (line in lines) {
@@ -1450,7 +1341,7 @@ object SrtBuilder {
             if (text.isEmpty() || text == "-") continue
             sb.append(n).append('\n')
             sb.append(ts(line.startMs)).append(" --> ").append(ts(line.endMs)).append('\n')
-            sb.append(Bidi.forRtlDisplay(text)).append('\n').append('\n')
+            sb.append(if (applyPersianBidi) Bidi.forRtlDisplay(text) else text).append('\n').append('\n')
             n++
         }
         return sb.toString()
@@ -1579,77 +1470,75 @@ class ProcessingService : Service() {
             }
             val lines = SegmentMerger.merge(cleaned)
 
-            stage("ترجمه…", 0.66f)
-            // ارائه‌دهندهٔ مرحلهٔ ترجمه قابل انتخاب است (گروک یا جمینای)؛ رونویسی همیشه با
-            // گروک/ویسپر باقی می‌ماند، فقط همین یک مرحله جابه‌جا می‌شود.
-            val useGemini = prefs.translationProvider == Prefs.PROVIDER_GEMINI
-            if (useGemini && prefs.geminiApiKey.isBlank()) {
-                error("کلید API جمینای را وارد کنید یا ارائه‌دهندهٔ ترجمه را روی گروک بگذارید")
-            }
-            // لحن محاوره‌ای با دمای بالاتر جواب بهتری می‌دهد: دمای پایین مدل را به‌سمت
-            // پرتکرارترین (و معمولاً رسمی‌ترین) عبارت‌های فارسی می‌کشاند.
-            val translationTemp = if (prefs.translationTone == Prefs.TONE_FORMAL) 0.2 else 0.6
-            val groqTranslator = BatchTranslator()
-            val groqCfg = BatchTranslator.Config(
-                baseUrl = prefs.baseUrl,
-                apiKey = prefs.apiKey,
-                model = prefs.chatModel,
-                temperature = translationTemp,
-            )
-            val geminiTranslator = GeminiBatchTranslator()
-            val geminiCfg = GeminiBatchTranslator.Config(
-                apiKey = prefs.geminiApiKey,
-                model = prefs.geminiModel,
-                temperature = translationTemp,
-            )
-            val langEnglish = langOf(language).english
-            val translated = ArrayList<TranslatedLine>()
-            // اندازهٔ دسته بزرگ‌تر شده (۱۵ → ۲۸) تا برای فایل‌های طولانی (مثلاً ۵۹۹ خط)
-            // تعداد کل درخواست‌های /chat/completions کمتر بشه و دیرتر به سقف نرخ گروک برسیم.
-            val batchSize = 28
-            val contextTail = ArrayDeque<String>()
-            var i = 0
-            var batchIndex = 0
-            val totalBatches = (lines.size + batchSize - 1) / batchSize.coerceAtLeast(1)
-            while (i < lines.size) {
-                val batch = lines.subList(i, minOf(i + batchSize, lines.size))
-                stage(
-                    "ترجمهٔ خط " + (i + 1) + " از " + lines.size + "…",
-                    0.66f + 0.28f * (i.toFloat() / lines.size.coerceAtLeast(1)),
-                )
-                val texts = batch.map { TextClean.normalize(it.sourceText) }
-                val out = if (useGemini) {
-                    geminiTranslator.translateBatch(
-                        texts, langEnglish, geminiCfg, contextTail.toList(), prefs.translationTone,
-                    )
-                } else {
-                    groqTranslator.translateBatch(
-                        texts, langEnglish, groqCfg, contextTail.toList(), prefs.translationTone,
-                    )
-                }
-                batch.forEachIndexed { j, line ->
-                    translated.add(TranslatedLine(line.startMs, line.endMs, out.getOrElse(j) { "" }))
-                }
-                out.forEach { contextTail.addLast(it) }
-                while (contextTail.size > 6) contextTail.removeFirst()
-                i += batchSize
-                batchIndex++
-                // فاصلهٔ کنترل‌شده بین درخواست‌های ترجمه، هم‌خانواده با تأخیر بین تکه‌های STT،
-                // تا فشار روی سقف دقیقه‌ای (RPM) کمتر بشه؛ در کنار retry با backoff داخل
-                // BatchTranslator، این باعث می‌شه فایل‌های خیلی طولانی هم بدون توقف کامل شوند.
-                if (batchIndex < totalBatches) delay(2_500)
-            }
-
-            stage("ساخت فایل SRT…", 0.96f)
-            val srtText = SrtBuilder.build(translated)
             val outDir = File(filesDir, "outputs").apply { mkdirs() }
             val outFile = File(outDir, baseName(inputFile) + ".srt")
-            outFile.writeText(srtText, Charsets.UTF_8)
 
-            Bus.resultPath.value = outFile.absolutePath
-            Bus.progress.value = 1f
-            Bus.stage.value = "تمام شد"
-            updateNotification("زیرنویس آماده است")
+            if (prefs.outputMode == Prefs.OUTPUT_ORIGINAL) {
+                // حالت «فقط زبان اصلی»: مرحلهٔ ترجمه کلاً اجرا نمی‌شود؛ متن خام رونویسی‌شده
+                // (بعد از ادغام جمله‌ها) مستقیماً به SRT تبدیل می‌شود تا کاربر خودش آن را
+                // کپی کند و جای دیگری (مثلاً یک چت‌بات جداگانه) ترجمه کند.
+                stage("ساخت فایل SRT زبان اصلی…", 0.9f)
+                val sourceOnly = lines.map { TranslatedLine(it.startMs, it.endMs, TextClean.normalize(it.sourceText)) }
+                val srtText = SrtBuilder.build(sourceOnly, applyPersianBidi = false)
+                outFile.writeText(srtText, Charsets.UTF_8)
+
+                Bus.resultPath.value = outFile.absolutePath
+                Bus.progress.value = 1f
+                Bus.stage.value = "زیرنویس زبان اصلی آماده شد"
+                updateNotification("زیرنویس زبان اصلی آماده است")
+            } else {
+                stage("ترجمه…", 0.66f)
+                // لحن محاوره‌ای با دمای بالاتر جواب بهتری می‌دهد: دمای پایین مدل را به‌سمت
+                // پرتکرارترین (و معمولاً رسمی‌ترین) عبارت‌های فارسی می‌کشاند.
+                val translationTemp = if (prefs.translationTone == Prefs.TONE_FORMAL) 0.2 else 0.6
+                val groqTranslator = BatchTranslator()
+                val groqCfg = BatchTranslator.Config(
+                    baseUrl = prefs.baseUrl,
+                    apiKey = prefs.apiKey,
+                    model = prefs.chatModel,
+                    temperature = translationTemp,
+                )
+                val langEnglish = langOf(language).english
+                val translated = ArrayList<TranslatedLine>()
+                // اندازهٔ دسته بزرگ‌تر شده (۱۵ → ۲۸) تا برای فایل‌های طولانی (مثلاً ۵۹۹ خط)
+                // تعداد کل درخواست‌های /chat/completions کمتر بشه و دیرتر به سقف نرخ گروک برسیم.
+                val batchSize = 28
+                val contextTail = ArrayDeque<String>()
+                var i = 0
+                var batchIndex = 0
+                val totalBatches = (lines.size + batchSize - 1) / batchSize.coerceAtLeast(1)
+                while (i < lines.size) {
+                    val batch = lines.subList(i, minOf(i + batchSize, lines.size))
+                    stage(
+                        "ترجمهٔ خط " + (i + 1) + " از " + lines.size + "…",
+                        0.66f + 0.28f * (i.toFloat() / lines.size.coerceAtLeast(1)),
+                    )
+                    val texts = batch.map { TextClean.normalize(it.sourceText) }
+                    val out = groqTranslator.translateBatch(
+                        texts, langEnglish, groqCfg, contextTail.toList(), prefs.translationTone,
+                    )
+                    batch.forEachIndexed { j, line ->
+                        translated.add(TranslatedLine(line.startMs, line.endMs, out.getOrElse(j) { "" }))
+                    }
+                    out.forEach { contextTail.addLast(it) }
+                    while (contextTail.size > 6) contextTail.removeFirst()
+                    i += batchSize
+                    batchIndex++
+                    // فاصلهٔ کنترل‌شده بین درخواست‌های ترجمه، هم‌خانواده با تأخیر بین تکه‌های STT،
+                    // تا فشار روی سقف دقیقه‌ای (RPM) کمتر بشه؛ در کنار retry با backoff داخل
+                    // BatchTranslator، این باعث می‌شه فایل‌های خیلی طولانی هم بدون توقف کامل شوند.
+                    if (batchIndex < totalBatches) delay(2_500)
+                }
+
+                stage("ساخت فایل SRT…", 0.96f)
+                val srtText = SrtBuilder.build(translated)
+                outFile.writeText(srtText, Charsets.UTF_8)
+
+                Bus.resultPath.value = outFile.absolutePath
+                Bus.progress.value = 1f
+                Bus.stage.value = "تمام شد"
+                updateNotification("زیرنویس آماده است")
+            }
         } catch (c: CancellationException) {
             Bus.stage.value = ""
         } catch (t: Throwable) {
@@ -1722,6 +1611,8 @@ cat > app/src/main/java/ir/livesub/MainActivity.kt <<'EOF_MAIN'
 package ir.livesub
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -1781,10 +1672,10 @@ private val TONE_OPTIONS = listOf(
     Prefs.TONE_FORMAL to "رسمی/کتابی",
 )
 
-/** ارائه‌دهندهٔ مرحلهٔ ترجمه؛ رونویسی صدا همیشه با گروک/ویسپر باقی می‌ماند. */
-private val PROVIDER_OPTIONS = listOf(
-    Prefs.PROVIDER_GROQ to "گروک (پیش‌فرض)",
-    Prefs.PROVIDER_GEMINI to "جمینای (Gemini)",
+/** خروجی زیرنویس: ترجمهٔ خودکار به فارسی، یا فقط زیرنویس زبان اصلی برای ترجمه در جای دیگر. */
+private val OUTPUT_MODE_OPTIONS = listOf(
+    Prefs.OUTPUT_TRANSLATE to "ترجمهٔ خودکار به فارسی (پیش‌فرض)",
+    Prefs.OUTPUT_ORIGINAL to "فقط زبان اصلی (بدون ترجمه، برای کپی و ترجمه در جای دیگر)",
 )
 
 class MainActivity : ComponentActivity() {
@@ -1861,10 +1752,6 @@ class MainActivity : ComponentActivity() {
             Bus.lastError.value = "کلید API گروک را وارد کنید"
             return
         }
-        if (prefs.translationProvider == Prefs.PROVIDER_GEMINI && prefs.geminiApiKey.isBlank()) {
-            Bus.lastError.value = "کلید API جمینای را وارد کنید یا ارائه‌دهندهٔ ترجمه را روی گروک بگذارید"
-            return
-        }
         val input = pendingInputFile
         if (input == null) {
             Bus.lastError.value = "اول یک فایل ویدیو یا صوتی انتخاب کنید"
@@ -1898,13 +1785,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun testGeminiKey() {
-        Bus.stage.value = "در حال آزمایش کلید جمینای…"
-        lifecycleScope.launch {
-            Bus.stage.value = Net.checkGeminiKey(prefs.geminiApiKey, prefs.geminiModel)
-        }
-    }
-
     // ------------------------------------------------------- دانلود/اشتراک‌گذاری (بند ۳.۹)
 
     private fun shareResult(path: String) {
@@ -1933,6 +1813,19 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * برای حالت «فقط زبان اصلی»: کل متن SRT را در کلیپ‌بورد می‌گذارد تا کاربر آن را در
+     * یک چت‌بات یا سرویس ترجمهٔ جداگانه پیست کند، بدون محدودیت‌های ترجمهٔ داخل اپ.
+     */
+    private fun copyResultToClipboard(path: String) {
+        runCatching {
+            val text = File(path).readText(Charsets.UTF_8)
+            val cm = getSystemService(ClipboardManager::class.java)
+            cm.setPrimaryClip(ClipData.newPlainText("زیرنویس", text))
+            Bus.stage.value = "زیرنویس در کلیپ‌بورد کپی شد"
+        }
+    }
+
     // ------------------------------------------------------- رابط کاربری
 
     @Composable
@@ -1950,9 +1843,7 @@ class MainActivity : ComponentActivity() {
         var chatModel by remember { mutableStateOf(prefs.chatModel) }
         var lang by remember { mutableStateOf(prefs.sourceLang) }
         var tone by remember { mutableStateOf(prefs.translationTone) }
-        var provider by remember { mutableStateOf(prefs.translationProvider) }
-        var geminiKey by remember { mutableStateOf(prefs.geminiApiKey) }
-        var geminiModel by remember { mutableStateOf(prefs.geminiModel) }
+        var outputMode by remember { mutableStateOf(prefs.outputMode) }
         var prompt by remember { mutableStateOf(promptValue) }
         var advanced by remember { mutableStateOf(false) }
 
@@ -2002,66 +1893,45 @@ class MainActivity : ComponentActivity() {
                 onSelect = { i -> lang = LANGS[i].code; prefs.sourceLang = lang },
             )
 
-            Section("ارائه‌دهندهٔ ترجمه")
+            Section("خروجی زیرنویس")
             Picker(
-                label = "ترجمهٔ متن با",
-                options = PROVIDER_OPTIONS.map { it.second },
-                selectedIndex = PROVIDER_OPTIONS.indexOfFirst { it.first == provider }.coerceAtLeast(0),
-                onSelect = { i -> provider = PROVIDER_OPTIONS[i].first; prefs.translationProvider = provider },
+                label = "زیرنویس چطور آماده شود",
+                options = OUTPUT_MODE_OPTIONS.map { it.second },
+                selectedIndex = OUTPUT_MODE_OPTIONS.indexOfFirst { it.first == outputMode }.coerceAtLeast(0),
+                onSelect = { i -> outputMode = OUTPUT_MODE_OPTIONS[i].first; prefs.outputMode = outputMode },
             )
             Text(
-                "رونویسی صدا همیشه با ویسپر روی گروک انجام می‌شود؛ این گزینه فقط مرحلهٔ ترجمهٔ " +
-                    "متن به فارسی را جابه‌جا می‌کند.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            if (provider == Prefs.PROVIDER_GEMINI) {
-                OutlinedTextField(
-                    value = geminiKey,
-                    onValueChange = { geminiKey = it; prefs.geminiApiKey = it.trim() },
-                    label = { Text("کلید API جمینای") },
-                    supportingText = { Text("از aistudio.google.com/apikey") },
-                    singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(),
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedButton(onClick = { testGeminiKey() }, modifier = Modifier.fillMaxWidth()) {
-                    Text("آزمایش کلید جمینای")
-                }
-                Picker(
-                    label = "مدل ترجمهٔ جمینای",
-                    options = GEMINI_MODELS.map { it.fa },
-                    selectedIndex = GEMINI_MODELS.indexOfFirst { it.id == geminiModel }.coerceAtLeast(0),
-                    onSelect = { i ->
-                        geminiModel = GEMINI_MODELS[i].id
-                        prefs.geminiModel = geminiModel
-                    },
-                )
-                Text(
-                    "این فهرست عمداً فقط شامل مدل‌هایی است که فعلاً روی کلید رایگان جمینای در " +
-                        "دسترس‌اند؛ چون گوگل گاهی این فهرست را تغییر می‌دهد، قبل از استفادهٔ حرفه‌ای " +
-                        "دوباره در ai.google.dev/pricing چک کنید.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-
-            Section("لحن ترجمه")
-            Picker(
-                label = "لحن",
-                options = TONE_OPTIONS.map { it.second },
-                selectedIndex = TONE_OPTIONS.indexOfFirst { it.first == tone }.coerceAtLeast(0),
-                onSelect = { i -> tone = TONE_OPTIONS[i].first; prefs.translationTone = tone },
-            )
-            Text(
-                if (tone == Prefs.TONE_FORMAL) {
-                    "مناسب مستند، سخنرانی و محتوای آموزشی."
+                if (outputMode == Prefs.OUTPUT_ORIGINAL) {
+                    "رونویسی همیشه با ویسپر روی گروک انجام می‌شود. در این حالت مرحلهٔ ترجمه اصلاً " +
+                        "اجرا نمی‌شود و فایل SRT به زبان اصلی صدا ساخته می‌شود؛ بعد از پایان کار " +
+                        "می‌توانید کل متن را با دکمهٔ «کپی زیرنویس» کپی کنید و در یک چت‌بات یا سرویس " +
+                        "ترجمهٔ جداگانه، بدون محدودیت این اپ، ترجمه کنید."
                 } else {
-                    "مناسب طنز، موزیکال و دیالوگ روزمره — از ترجمهٔ کتابی و خشک پرهیز می‌کند."
+                    "رونویسی صدا همیشه با ویسپر روی گروک انجام می‌شود و بعد متن با گروک به فارسی " +
+                        "ترجمه می‌شود."
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+
+            if (outputMode == Prefs.OUTPUT_TRANSLATE) {
+                Section("لحن ترجمه")
+                Picker(
+                    label = "لحن",
+                    options = TONE_OPTIONS.map { it.second },
+                    selectedIndex = TONE_OPTIONS.indexOfFirst { it.first == tone }.coerceAtLeast(0),
+                    onSelect = { i -> tone = TONE_OPTIONS[i].first; prefs.translationTone = tone },
+                )
+                Text(
+                    if (tone == Prefs.TONE_FORMAL) {
+                        "مناسب مستند، سخنرانی و محتوای آموزشی."
+                    } else {
+                        "مناسب طنز، موزیکال و دیالوگ روزمره — از ترجمهٔ کتابی و خشک پرهیز می‌کند."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
 
             OutlinedTextField(
                 value = prompt,
@@ -2095,8 +1965,8 @@ class MainActivity : ComponentActivity() {
                     label = { Text("مدل ترجمهٔ گروک") },
                     supportingText = {
                         Text(
-                            "فقط وقتی «ترجمهٔ متن با» روی گروک است استفاده می‌شود. پیش‌فرض " +
-                                Prefs.CHAT_MODEL + " — برای ترجمهٔ محاوره‌ای‌تر می‌توانید " +
+                            "فقط وقتی خروجی زیرنویس روی «ترجمهٔ خودکار به فارسی» باشد استفاده می‌شود. " +
+                                "پیش‌فرض " + Prefs.CHAT_MODEL + " — برای ترجمهٔ محاوره‌ای‌تر می‌توانید " +
                                 "moonshotai/kimi-k2-instruct-0905 را هم امتحان کنید (کندتر و گران‌تر)"
                         )
                     },
@@ -2140,8 +2010,22 @@ class MainActivity : ComponentActivity() {
             val result = resultPath
             if (result != null) {
                 Section("خروجی")
+                if (outputMode == Prefs.OUTPUT_ORIGINAL) {
+                    Text(
+                        "این زیرنویس به زبان اصلی صداست (ترجمه نشده). می‌توانید کل متن را کپی کنید " +
+                            "و در یک چت‌بات یا سرویس ترجمهٔ جداگانه به فارسی ترجمه کنید.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Button(
+                        onClick = { copyResultToClipboard(result) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("کپی زیرنویس")
+                    }
+                }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = { shareResult(result) }, modifier = Modifier.weight(1f)) {
+                    OutlinedButton(onClick = { shareResult(result) }, modifier = Modifier.weight(1f)) {
                         Text("اشتراک‌گذاری")
                     }
                     OutlinedButton(onClick = { requestSave(result) }, modifier = Modifier.weight(1f)) {
