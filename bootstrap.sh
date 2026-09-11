@@ -1099,8 +1099,13 @@ object SegmentMerger {
     private val SENTENCE_END = Regex("[.!?…؟]\\s*$")
     // حداکثر مدتی که یک زیرنویس روی صفحه می‌ماند و حداکثر طول متنش، حتی وقتی به علامت
     // پایان جمله نرسیده‌ایم (استاندارد رایج زیرنویس: چند ثانیه، نه ده‌ها ثانیه)
-    private const val MAX_MERGE_MS = 6_000L
-    private const val MAX_MERGE_CHARS = 140
+    private const val MAX_MERGE_MS = 5_000L
+    private const val MAX_MERGE_CHARS = 100
+
+    // حداکثر تعداد جمله‌ای که در یک خط زیرنویس ادغام می‌شود — حتی اگر segmentهای خام
+    // ویسپر علامت پایان جمله نداشته باشند (که برای دیالوگ‌های محاوره‌ای/سریع خیلی پیش
+    // می‌آید) این عدد قطعی جلوی چسبیدن ۳-۴ جمله به هم در یک خط را می‌گیرد.
+    private const val MAX_SENTENCES_PER_LINE = 2
 
     // مکثی به این اندازه بین دو segment یعنی گویا جملهٔ جدیدی شروع شده، حتی اگر
     // segment قبلی با علامت پایان جمله تمام نشده باشد
@@ -1140,6 +1145,7 @@ object SegmentMerger {
         var bufEnd = -1L
         val bufText = StringBuilder()
         var prevEndMs = -1L
+        var bufParts = 0
 
         fun flush() {
             if (bufText.isNotBlank()) {
@@ -1149,6 +1155,7 @@ object SegmentMerger {
             bufEnd = -1L
             bufText.clear()
             prevEndMs = -1L
+            bufParts = 0
         }
 
         for (seg in expanded) {
@@ -1166,9 +1173,13 @@ object SegmentMerger {
             bufText.append(text)
             bufEnd = endMs
             prevEndMs = endMs
+            bufParts++
 
             val tooLong = (bufEnd - bufStart) > MAX_MERGE_MS || bufText.length > MAX_MERGE_CHARS
-            if (SENTENCE_END.containsMatchIn(text) || tooLong) flush()
+            val endsSentence = SENTENCE_END.containsMatchIn(text)
+            // پس از رسیدن به سقف جمله‌ها، حتی اگر segment فعلی خودش با علامت پایان جمله
+            // تمام نشده باشد (مثلاً در دیالوگ بی‌علامت)، همین‌جا خط را می‌بندیم.
+            if (endsSentence || tooLong || bufParts >= MAX_SENTENCES_PER_LINE) flush()
         }
         flush()
         return out
