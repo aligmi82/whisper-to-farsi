@@ -301,14 +301,65 @@ class Prefs(context: Context) {
         }
         set(v) { w("tr_tone", v) }
 
+    /**
+     * کلید API جمینای (Google AI Studio)، جدا از کلید گروک. رونویسی همچنان فقط با
+     * گروک انجام می‌شود؛ این کلید فقط برای مرحلهٔ ترجمه وقتی translationProvider
+     * روی جمینای باشد استفاده می‌شود.
+     */
+    var geminiApiKey: String
+        get() = s("gem_key", "")
+        set(v) { w("gem_key", v) }
+
+    /** مدل ترجمهٔ جمینای؛ فقط از میان مدل‌هایی که فعلاً در سطح رایگان جمینای هستند (GEMINI_MODELS). */
+    var geminiModel: String
+        get() {
+            val v = s("gem_model", GEMINI_MODEL)
+            return if (v.isBlank()) GEMINI_MODEL else v
+        }
+        set(v) { w("gem_model", v) }
+
+    /** ارائه‌دهندهٔ مرحلهٔ ترجمه: گروک (PROVIDER_GROQ) یا جمینای (PROVIDER_GEMINI). رونویسی همیشه با گروک است. */
+    var translationProvider: String
+        get() {
+            val v = s("tr_provider", PROVIDER_GROQ)
+            return if (v.isBlank()) PROVIDER_GROQ else v
+        }
+        set(v) { w("tr_provider", v) }
+
     companion object {
         const val GROQ_URL = "https://api.groq.com/openai/v1"
         const val STT_MODEL = "whisper-large-v3"
         const val CHAT_MODEL = "openai/gpt-oss-120b"
         const val TONE_NATURAL = "natural"
         const val TONE_FORMAL = "formal"
+
+        const val PROVIDER_GROQ = "groq"
+        const val PROVIDER_GEMINI = "gemini"
+
+        // فقط مدل ترجمهٔ متنی؛ رونویسی صدا همیشه با ویسپر روی گروک باقی می‌ماند
+        const val GEMINI_MODEL = "gemini-2.5-flash"
     }
 }
+
+/**
+ * فهرست مدل‌های جمینای که «فقط» برای ترجمه (Picker مدل ترجمه، وقتی ارائه‌دهنده جمینای
+ * است) نمایش داده می‌شوند. عمداً محدود به مدل‌هایی شده که طبق صفحهٔ رسمی قیمت‌گذاری
+ * (ai.google.dev/pricing) در حال حاضر ورودی/خروجی‌شان روی کلید رایگان Google AI Studio
+ * «Free of charge» است — یعنی مدل‌های Pro-preview، image، TTS و مانند این‌ها که فقط
+ * روی سطح پولی هستند عمداً حذف شده‌اند. چون این وضعیت هر چند وقت یک‌بار توسط گوگل
+ * تغییر می‌کند، قبل از تکیه‌کردن روی این لیست دوباره از صفحهٔ رسمی قیمت‌گذاری چک شود.
+ */
+data class GeminiModelOption(val id: String, val fa: String)
+
+val GEMINI_MODELS = listOf(
+    GeminiModelOption("gemini-2.5-pro", "Gemini 2.5 Pro (باکیفیت‌ترین، رایگان)"),
+    GeminiModelOption("gemini-3-flash-preview", "Gemini 3 Flash Preview (جدیدترین، رایگان)"),
+    GeminiModelOption("gemini-2.5-flash", "Gemini 2.5 Flash (پیش‌فرض، رایگان)"),
+    GeminiModelOption("gemini-2.5-flash-lite", "Gemini 2.5 Flash-Lite (سریع‌تر، رایگان)"),
+    GeminiModelOption("gemini-3.1-flash-lite-preview", "Gemini 3.1 Flash-Lite Preview (رایگان)"),
+    GeminiModelOption("gemini-2.0-flash", "Gemini 2.0 Flash (رایگان)"),
+    GeminiModelOption("gemini-2.0-flash-lite", "Gemini 2.0 Flash-Lite (رایگان)"),
+)
 
 // ======================================================= زبان‌ها
 
@@ -460,6 +511,34 @@ object Net {
             "خطای شبکه: " + (t.message ?: "نامعلوم")
         }
     }
+
+    /** آزمایش دستی کلید جمینای: کلید سالم است؟ مدل انتخاب‌شده برای ترجمه در دسترس است؟ */
+    suspend fun checkGeminiKey(apiKey: String, model: String): String = withContext(Dispatchers.IO) {
+        if (apiKey.isBlank()) return@withContext "اول کلید جمینای را وارد کنید"
+        try {
+            val req = Request.Builder()
+                .url(GeminiBatchTranslator.API_BASE + "/models?key=" + apiKey)
+                .build()
+            chat.newCall(req).execute().use { r ->
+                val body = r.body?.string().orEmpty()
+                if (!r.isSuccessful) {
+                    return@withContext "کلید جمینای پذیرفته نشد (کد " + r.code + "): " + body.take(120)
+                }
+                val arr: JSONArray? = JSONObject(body).optJSONArray("models")
+                val names = ArrayList<String>()
+                if (arr != null) {
+                    for (i in 0 until arr.length()) {
+                        // فرمت شناسهٔ مدل در این endpoint معمولاً "models/gemini-2.5-flash" است
+                        names.add(arr.optJSONObject(i)?.optString("name").orEmpty().removePrefix("models/"))
+                    }
+                }
+                val b = if (names.contains(model)) "موجود" else "پیدا نشد"
+                "کلید جمینای سالم است. مدل ترجمه: " + b
+            }
+        } catch (t: Throwable) {
+            "خطای شبکه: " + (t.message ?: "نامعلوم")
+        }
+    }
 }
 
 /** رونویسی با ویسپر روی گروک، خروجی segment‌دار برای ساخت SRT (بند ۳.۴ سند مهاجرت). */
@@ -548,7 +627,93 @@ class SttClient(private val http: OkHttpClient = Net.stt) {
     }
 }
 
-/** ترجمهٔ دسته‌ای غیر-استریمی؛ چند خط با شماره‌گذاری در یک درخواست (بند ۳.۶ سند مهاجرت). */
+/**
+ * پرامپت سیستمی و پارس خروجی شماره‌گذاری‌شده بین BatchTranslator (گروک) و
+ * GeminiBatchTranslator (جمینای) مشترک است، چون هر دو دقیقاً همان قرارداد
+ * «یک خط شماره‌گذاری‌شده به ازای هر ورودی» را از مدل می‌خواهند.
+ */
+private object TranslationPrompt {
+
+    /**
+     * لحن «طبیعی» (پیش‌فرض) صراحتاً از ترجمهٔ کتابی/رسمی پرهیز می‌دهد تا طنز، موزیکال و
+     * دیالوگ روزمره بی‌روح و مصنوعی درنیایند. لحن «رسمی» برای محتوای مستند/آموزشی/سخنرانی
+     * همان رفتار قبلی را حفظ می‌کند.
+     */
+    fun systemPrompt(src: String, tone: String): String {
+        val base = "Translate each numbered line from " + src +
+            " into fluent, idiomatic Persian — full natural sentences, not a literal " +
+            "word-for-word rendering. Preserve punctuation that signals tone (question marks, " +
+            "exclamation marks, ellipses). Keep names and numbers. Use the provided context only " +
+            "to keep pronouns, tone, and cross-sentence references consistent; never translate or " +
+            "renumber the context lines themselves. Reply with the SAME numbering, one translated " +
+            "line per number, nothing else — no preface, no notes. If a line has nothing " +
+            "translatable, reply for that number with a single hyphen: -"
+
+        val styleNote = if (tone == Prefs.TONE_FORMAL) {
+            " Use formal written Persian (نوشتاری/رسمی) throughout, the register appropriate " +
+                "for documentaries, lectures, or instructional narration."
+        } else {
+            " Use everyday spoken Persian (محاوره‌ای) — the way people actually talk — instead " +
+                "of literary or textbook Persian. Match each line's emotional register and " +
+                "energy: casual banter should sound casual, jokes should land with natural " +
+                "Persian comic timing and wordplay rather than a stiff literal translation of " +
+                "the source pun, song lyrics should read rhythmically rather than as flat " +
+                "prose, and exclamations or reactions should sound like something a person " +
+                "would actually blurt out. Prefer common contractions and colloquial verb " +
+                "forms (e.g. می‌خوام instead of می‌خواهم, نمی‌دونم instead of نمی‌دانم) over " +
+                "stiff literary forms, unless a character's own dialogue is deliberately formal " +
+                "or old-fashioned.\n\n" +
+                "Examples of the required shift — WRONG (too literary, do NOT translate like " +
+                "this) vs RIGHT (natural, spoken):\n" +
+                "1. \"I don't know what you're talking about.\"\n" +
+                "   WRONG: «نمی‌دانم دربارهٔ چه موضوعی صحبت می‌کنید.»\n" +
+                "   RIGHT: «نمی‌دونم داری چی میگی.»\n" +
+                "2. \"Are you kidding me?\"\n" +
+                "   WRONG: «آیا شوخی می‌کنید؟»\n" +
+                "   RIGHT: «شوخیت گرفته؟»\n" +
+                "3. \"Come on, let's go!\"\n" +
+                "   WRONG: «بیایید برویم.»\n" +
+                "   RIGHT: «یالا، بریم!»\n" +
+                "4. \"I can't believe this is happening.\"\n" +
+                "   WRONG: «باور نمی‌کنم این اتفاق در حال وقوع است.»\n" +
+                "   RIGHT: «باورم نمی‌شه داره این اتفاق میفته.»\n" +
+                "Every line you output should read like the RIGHT column above, not the WRONG one."
+        }
+        return base + styleNote
+    }
+
+    fun parseNumbered(raw: String, expected: Int): List<String> {
+        val out = MutableList(expected) { "" }
+        val re = Regex("(?m)^\\s*(\\d+)[.\\)]\\s*(.*)$")
+        var matched = 0
+        for (m in re.findAll(raw)) {
+            val idx = m.groupValues[1].toIntOrNull() ?: continue
+            if (idx in 1..expected) {
+                out[idx - 1] = m.groupValues[2].trim()
+                matched++
+            }
+        }
+        if (matched < expected) {
+            // اگر مدل شماره‌گذاری را کامل برنگرداند، بر اساس ترتیب خطوط غیرخالی پر می‌شود
+            val fallback = raw.lines().map { it.trim() }.filter { it.isNotBlank() }
+            for (i in out.indices) {
+                if (out[i].isBlank() && i < fallback.size) out[i] = fallback[i]
+            }
+        }
+        return out
+    }
+
+    fun contextBlock(contextTail: List<String>): String = if (contextTail.isNotEmpty()) {
+        "Context from the immediately preceding lines (already translated; for pronoun/tone " +
+            "continuity only, do not re-translate or re-number them):\n" +
+            contextTail.takeLast(6).joinToString("\n") + "\n\n"
+    } else ""
+
+    fun numberedLines(lines: List<String>): String =
+        lines.mapIndexed { i, t -> (i + 1).toString() + ". " + t }.joinToString("\n")
+}
+
+/** ترجمهٔ دسته‌ای غیر-استریمی روی گروک؛ چند خط با شماره‌گذاری در یک درخواست (بند ۳.۶ سند مهاجرت). */
 class BatchTranslator(private val http: OkHttpClient = Net.chat) {
 
     data class Config(
@@ -590,15 +755,11 @@ class BatchTranslator(private val http: OkHttpClient = Net.chat) {
         contextTail: List<String>,
         tone: String,
     ): List<String> = withContext(Dispatchers.IO) {
-        val numbered = lines.mapIndexed { i, t -> (i + 1).toString() + ". " + t }.joinToString("\n")
-        val contextBlock = if (contextTail.isNotEmpty()) {
-            "Context from the immediately preceding lines (already translated; for pronoun/tone " +
-                "continuity only, do not re-translate or re-number them):\n" +
-                contextTail.takeLast(6).joinToString("\n") + "\n\n"
-        } else ""
+        val numbered = TranslationPrompt.numberedLines(lines)
+        val contextBlock = TranslationPrompt.contextBlock(contextTail)
 
         val messages = JSONArray().apply {
-            put(msg("system", systemPrompt(sourceLanguageEnglish, tone)))
+            put(msg("system", TranslationPrompt.systemPrompt(sourceLanguageEnglish, tone)))
             put(msg("user", contextBlock + numbered))
         }
         val payload = JSONObject().apply {
@@ -623,71 +784,117 @@ class BatchTranslator(private val http: OkHttpClient = Net.chat) {
                     .getJSONObject("message").optString("content")
             }.getOrDefault("")
         }
-        parseNumbered(raw, lines.size)
-    }
-
-    private fun parseNumbered(raw: String, expected: Int): List<String> {
-        val out = MutableList(expected) { "" }
-        val re = Regex("(?m)^\\s*(\\d+)[.\\)]\\s*(.*)$")
-        var matched = 0
-        for (m in re.findAll(raw)) {
-            val idx = m.groupValues[1].toIntOrNull() ?: continue
-            if (idx in 1..expected) {
-                out[idx - 1] = m.groupValues[2].trim()
-                matched++
-            }
-        }
-        if (matched < expected) {
-            // اگر مدل شماره‌گذاری را کامل برنگرداند، بر اساس ترتیب خطوط غیرخالی پر می‌شود
-            val fallback = raw.lines().map { it.trim() }.filter { it.isNotBlank() }
-            for (i in out.indices) {
-                if (out[i].isBlank() && i < fallback.size) out[i] = fallback[i]
-            }
-        }
-        return out
+        TranslationPrompt.parseNumbered(raw, lines.size)
     }
 
     private fun msg(role: String, content: String) =
         JSONObject().put("role", role).put("content", content)
-
-    /**
-     * لحن «طبیعی» (پیش‌فرض) صراحتاً از ترجمهٔ کتابی/رسمی پرهیز می‌دهد تا طنز، موزیکال و
-     * دیالوگ روزمره بی‌روح و مصنوعی درنیایند. لحن «رسمی» برای محتوای مستند/آموزشی/سخنرانی
-     * همان رفتار قبلی را حفظ می‌کند.
-     */
-    private fun systemPrompt(src: String, tone: String): String {
-        val base = "Translate each numbered line from " + src +
-            " into fluent, idiomatic Persian — full natural sentences, not a literal " +
-            "word-for-word rendering. Preserve punctuation that signals tone (question marks, " +
-            "exclamation marks, ellipses). Keep names and numbers. Use the provided context only " +
-            "to keep pronouns, tone, and cross-sentence references consistent; never translate or " +
-            "renumber the context lines themselves. Reply with the SAME numbering, one translated " +
-            "line per number, nothing else — no preface, no notes. If a line has nothing " +
-            "translatable, reply for that number with a single hyphen: -"
-
-        val styleNote = if (tone == Prefs.TONE_FORMAL) {
-            " Use formal written Persian (نوشتاری/رسمی) throughout, the register appropriate " +
-                "for documentaries, lectures, or instructional narration."
-        } else {
-            " Use everyday spoken Persian (محاوره‌ای) — the way people actually talk — instead " +
-                "of literary or textbook Persian. Match each line's emotional register and " +
-                "energy: casual banter should sound casual, jokes should land with natural " +
-                "Persian comic timing and wordplay rather than a stiff literal translation of " +
-                "the source pun, song lyrics should read rhythmically rather than as flat " +
-                "prose, and exclamations or reactions should sound like something a person " +
-                "would actually blurt out. Prefer common contractions and colloquial verb " +
-                "forms (e.g. می‌خوام instead of می‌خواهم, نمی‌دونم instead of نمی‌دانم) over " +
-                "stiff literary forms, unless a character's own dialogue is deliberately formal " +
-                "or old-fashioned."
-        }
-        return base + styleNote
-    }
 
     private companion object {
         val JSON = "application/json; charset=utf-8".toMediaType()
         const val MAX_RETRIES = 6
     }
 }
+
+/**
+ * ترجمهٔ دسته‌ای روی Gemini API (Google AI Studio)، با همان قرارداد BatchTranslator
+ * (شماره‌گذاری خطوط، همان پرامپت سیستمی، همان منطق retry با backoff روی ۴۲۹) اما با
+ * فرمت درخواست/پاسخ REST جمینای که با OpenAI-style chat/completions گروک فرق دارد:
+ * کلید API به‌صورت query param است، نه هدر Authorization، و متن پاسخ زیر
+ * candidates[0].content.parts[0].text می‌آید.
+ */
+class GeminiBatchTranslator(private val http: OkHttpClient = Net.chat) {
+
+    data class Config(
+        val apiKey: String,
+        val model: String,
+        val temperature: Double = 0.3,
+    )
+
+    private class RateLimitedException(msg: String) : IOException(msg)
+
+    suspend fun translateBatch(
+        lines: List<String>,
+        sourceLanguageEnglish: String,
+        cfg: Config,
+        contextTail: List<String> = emptyList(),
+        tone: String = Prefs.TONE_NATURAL,
+    ): List<String> {
+        if (lines.isEmpty()) return emptyList()
+        var attempt = 0
+        var delayMs = 2_000L
+        while (true) {
+            try {
+                return doTranslate(lines, sourceLanguageEnglish, cfg, contextTail, tone)
+            } catch (rl: RateLimitedException) {
+                attempt++
+                if (attempt > MAX_RETRIES) throw rl
+                delay(delayMs)
+                delayMs = (delayMs * 2).coerceAtMost(60_000L)
+            }
+        }
+    }
+
+    private suspend fun doTranslate(
+        lines: List<String>,
+        sourceLanguageEnglish: String,
+        cfg: Config,
+        contextTail: List<String>,
+        tone: String,
+    ): List<String> = withContext(Dispatchers.IO) {
+        val numbered = TranslationPrompt.numberedLines(lines)
+        val contextBlock = TranslationPrompt.contextBlock(contextTail)
+
+        val payload = JSONObject().apply {
+            put(
+                "systemInstruction",
+                JSONObject().put(
+                    "parts",
+                    JSONArray().put(JSONObject().put("text", TranslationPrompt.systemPrompt(sourceLanguageEnglish, tone))),
+                ),
+            )
+            put(
+                "contents",
+                JSONArray().put(
+                    JSONObject()
+                        .put("role", "user")
+                        .put("parts", JSONArray().put(JSONObject().put("text", contextBlock + numbered))),
+                ),
+            )
+            put(
+                "generationConfig",
+                JSONObject()
+                    .put("temperature", cfg.temperature)
+                    .put("maxOutputTokens", 4000),
+            )
+        }
+
+        val url = API_BASE + "/models/" + cfg.model + ":generateContent?key=" + cfg.apiKey
+        val req = Request.Builder()
+            .url(url)
+            .post(payload.toString().toRequestBody(JSON))
+            .build()
+
+        val raw = http.newCall(req).execute().use { resp ->
+            val body = resp.body?.string().orEmpty()
+            if (resp.code == 429) throw RateLimitedException(body.take(200))
+            if (!resp.isSuccessful) throw IOException("Gemini " + resp.code + ": " + body.take(200))
+            runCatching {
+                JSONObject(body).getJSONArray("candidates").getJSONObject(0)
+                    .getJSONObject("content").getJSONArray("parts").getJSONObject(0)
+                    .optString("text")
+            }.getOrDefault("")
+        }
+        TranslationPrompt.parseNumbered(raw, lines.size)
+    }
+
+    companion object {
+        const val API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+        private val JSON = "application/json; charset=utf-8".toMediaType()
+        private const val MAX_RETRIES = 6
+    }
+}
+
 
 // ======================================================= پاک‌سازی متن
 
@@ -1373,11 +1580,27 @@ class ProcessingService : Service() {
             val lines = SegmentMerger.merge(cleaned)
 
             stage("ترجمه…", 0.66f)
-            val translator = BatchTranslator()
-            val chatCfg = BatchTranslator.Config(
+            // ارائه‌دهندهٔ مرحلهٔ ترجمه قابل انتخاب است (گروک یا جمینای)؛ رونویسی همیشه با
+            // گروک/ویسپر باقی می‌ماند، فقط همین یک مرحله جابه‌جا می‌شود.
+            val useGemini = prefs.translationProvider == Prefs.PROVIDER_GEMINI
+            if (useGemini && prefs.geminiApiKey.isBlank()) {
+                error("کلید API جمینای را وارد کنید یا ارائه‌دهندهٔ ترجمه را روی گروک بگذارید")
+            }
+            // لحن محاوره‌ای با دمای بالاتر جواب بهتری می‌دهد: دمای پایین مدل را به‌سمت
+            // پرتکرارترین (و معمولاً رسمی‌ترین) عبارت‌های فارسی می‌کشاند.
+            val translationTemp = if (prefs.translationTone == Prefs.TONE_FORMAL) 0.2 else 0.6
+            val groqTranslator = BatchTranslator()
+            val groqCfg = BatchTranslator.Config(
                 baseUrl = prefs.baseUrl,
                 apiKey = prefs.apiKey,
                 model = prefs.chatModel,
+                temperature = translationTemp,
+            )
+            val geminiTranslator = GeminiBatchTranslator()
+            val geminiCfg = GeminiBatchTranslator.Config(
+                apiKey = prefs.geminiApiKey,
+                model = prefs.geminiModel,
+                temperature = translationTemp,
             )
             val langEnglish = langOf(language).english
             val translated = ArrayList<TranslatedLine>()
@@ -1395,9 +1618,15 @@ class ProcessingService : Service() {
                     0.66f + 0.28f * (i.toFloat() / lines.size.coerceAtLeast(1)),
                 )
                 val texts = batch.map { TextClean.normalize(it.sourceText) }
-                val out = translator.translateBatch(
-                    texts, langEnglish, chatCfg, contextTail.toList(), prefs.translationTone,
-                )
+                val out = if (useGemini) {
+                    geminiTranslator.translateBatch(
+                        texts, langEnglish, geminiCfg, contextTail.toList(), prefs.translationTone,
+                    )
+                } else {
+                    groqTranslator.translateBatch(
+                        texts, langEnglish, groqCfg, contextTail.toList(), prefs.translationTone,
+                    )
+                }
                 batch.forEachIndexed { j, line ->
                     translated.add(TranslatedLine(line.startMs, line.endMs, out.getOrElse(j) { "" }))
                 }
@@ -1552,6 +1781,12 @@ private val TONE_OPTIONS = listOf(
     Prefs.TONE_FORMAL to "رسمی/کتابی",
 )
 
+/** ارائه‌دهندهٔ مرحلهٔ ترجمه؛ رونویسی صدا همیشه با گروک/ویسپر باقی می‌ماند. */
+private val PROVIDER_OPTIONS = listOf(
+    Prefs.PROVIDER_GROQ to "گروک (پیش‌فرض)",
+    Prefs.PROVIDER_GEMINI to "جمینای (Gemini)",
+)
+
 class MainActivity : ComponentActivity() {
 
     private lateinit var prefs: Prefs
@@ -1626,6 +1861,10 @@ class MainActivity : ComponentActivity() {
             Bus.lastError.value = "کلید API گروک را وارد کنید"
             return
         }
+        if (prefs.translationProvider == Prefs.PROVIDER_GEMINI && prefs.geminiApiKey.isBlank()) {
+            Bus.lastError.value = "کلید API جمینای را وارد کنید یا ارائه‌دهندهٔ ترجمه را روی گروک بگذارید"
+            return
+        }
         val input = pendingInputFile
         if (input == null) {
             Bus.lastError.value = "اول یک فایل ویدیو یا صوتی انتخاب کنید"
@@ -1656,6 +1895,13 @@ class MainActivity : ComponentActivity() {
         Bus.stage.value = "در حال آزمایش کلید…"
         lifecycleScope.launch {
             Bus.stage.value = Net.checkKey(prefs.baseUrl, prefs.apiKey, prefs.sttModel, prefs.chatModel)
+        }
+    }
+
+    private fun testGeminiKey() {
+        Bus.stage.value = "در حال آزمایش کلید جمینای…"
+        lifecycleScope.launch {
+            Bus.stage.value = Net.checkGeminiKey(prefs.geminiApiKey, prefs.geminiModel)
         }
     }
 
@@ -1704,6 +1950,9 @@ class MainActivity : ComponentActivity() {
         var chatModel by remember { mutableStateOf(prefs.chatModel) }
         var lang by remember { mutableStateOf(prefs.sourceLang) }
         var tone by remember { mutableStateOf(prefs.translationTone) }
+        var provider by remember { mutableStateOf(prefs.translationProvider) }
+        var geminiKey by remember { mutableStateOf(prefs.geminiApiKey) }
+        var geminiModel by remember { mutableStateOf(prefs.geminiModel) }
         var prompt by remember { mutableStateOf(promptValue) }
         var advanced by remember { mutableStateOf(false) }
 
@@ -1753,6 +2002,50 @@ class MainActivity : ComponentActivity() {
                 onSelect = { i -> lang = LANGS[i].code; prefs.sourceLang = lang },
             )
 
+            Section("ارائه‌دهندهٔ ترجمه")
+            Picker(
+                label = "ترجمهٔ متن با",
+                options = PROVIDER_OPTIONS.map { it.second },
+                selectedIndex = PROVIDER_OPTIONS.indexOfFirst { it.first == provider }.coerceAtLeast(0),
+                onSelect = { i -> provider = PROVIDER_OPTIONS[i].first; prefs.translationProvider = provider },
+            )
+            Text(
+                "رونویسی صدا همیشه با ویسپر روی گروک انجام می‌شود؛ این گزینه فقط مرحلهٔ ترجمهٔ " +
+                    "متن به فارسی را جابه‌جا می‌کند.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (provider == Prefs.PROVIDER_GEMINI) {
+                OutlinedTextField(
+                    value = geminiKey,
+                    onValueChange = { geminiKey = it; prefs.geminiApiKey = it.trim() },
+                    label = { Text("کلید API جمینای") },
+                    supportingText = { Text("از aistudio.google.com/apikey") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedButton(onClick = { testGeminiKey() }, modifier = Modifier.fillMaxWidth()) {
+                    Text("آزمایش کلید جمینای")
+                }
+                Picker(
+                    label = "مدل ترجمهٔ جمینای",
+                    options = GEMINI_MODELS.map { it.fa },
+                    selectedIndex = GEMINI_MODELS.indexOfFirst { it.id == geminiModel }.coerceAtLeast(0),
+                    onSelect = { i ->
+                        geminiModel = GEMINI_MODELS[i].id
+                        prefs.geminiModel = geminiModel
+                    },
+                )
+                Text(
+                    "این فهرست عمداً فقط شامل مدل‌هایی است که فعلاً روی کلید رایگان جمینای در " +
+                        "دسترس‌اند؛ چون گوگل گاهی این فهرست را تغییر می‌دهد، قبل از استفادهٔ حرفه‌ای " +
+                        "دوباره در ai.google.dev/pricing چک کنید.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
             Section("لحن ترجمه")
             Picker(
                 label = "لحن",
@@ -1799,8 +2092,14 @@ class MainActivity : ComponentActivity() {
                 OutlinedTextField(
                     value = chatModel,
                     onValueChange = { chatModel = it; prefs.chatModel = it.trim() },
-                    label = { Text("مدل ترجمه") },
-                    supportingText = { Text("پیش‌فرض " + Prefs.CHAT_MODEL) },
+                    label = { Text("مدل ترجمهٔ گروک") },
+                    supportingText = {
+                        Text(
+                            "فقط وقتی «ترجمهٔ متن با» روی گروک است استفاده می‌شود. پیش‌فرض " +
+                                Prefs.CHAT_MODEL + " — برای ترجمهٔ محاوره‌ای‌تر می‌توانید " +
+                                "moonshotai/kimi-k2-instruct-0905 را هم امتحان کنید (کندتر و گران‌تر)"
+                        )
+                    },
                     singleLine = true, modifier = Modifier.fillMaxWidth(),
                 )
             }
