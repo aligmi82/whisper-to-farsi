@@ -290,10 +290,23 @@ class Prefs(context: Context) {
         get() = s("src_lang", "en")
         set(v) { w("src_lang", v) }
 
+    /**
+     * لحن ترجمه: طبیعی/محاوره‌ای (پیش‌فرض، برای طنز/موزیکال/دیالوگ روزمره) یا
+     * رسمی/کتابی (برای مستند، آموزشی، سخنرانی).
+     */
+    var translationTone: String
+        get() {
+            val v = s("tr_tone", TONE_NATURAL)
+            return if (v.isBlank()) TONE_NATURAL else v
+        }
+        set(v) { w("tr_tone", v) }
+
     companion object {
         const val GROQ_URL = "https://api.groq.com/openai/v1"
         const val STT_MODEL = "whisper-large-v3"
         const val CHAT_MODEL = "openai/gpt-oss-120b"
+        const val TONE_NATURAL = "natural"
+        const val TONE_FORMAL = "formal"
     }
 }
 
@@ -545,14 +558,38 @@ class BatchTranslator(private val http: OkHttpClient = Net.chat) {
         val temperature: Double = 0.3,
     )
 
+    private class RateLimitedException(msg: String) : IOException(msg)
+
+    /** در برخورد با کد ۴۲۹ با تأخیر تصاعدی دوباره تلاش می‌کند، دقیقاً مثل SttClient. */
     suspend fun translateBatch(
         lines: List<String>,
         sourceLanguageEnglish: String,
         cfg: Config,
         contextTail: List<String> = emptyList(),
-    ): List<String> = withContext(Dispatchers.IO) {
-        if (lines.isEmpty()) return@withContext emptyList()
+        tone: String = Prefs.TONE_NATURAL,
+    ): List<String> {
+        if (lines.isEmpty()) return emptyList()
+        var attempt = 0
+        var delayMs = 2_000L
+        while (true) {
+            try {
+                return doTranslate(lines, sourceLanguageEnglish, cfg, contextTail, tone)
+            } catch (rl: RateLimitedException) {
+                attempt++
+                if (attempt > MAX_RETRIES) throw rl
+                delay(delayMs)
+                delayMs = (delayMs * 2).coerceAtMost(60_000L)
+            }
+        }
+    }
 
+    private suspend fun doTranslate(
+        lines: List<String>,
+        sourceLanguageEnglish: String,
+        cfg: Config,
+        contextTail: List<String>,
+        tone: String,
+    ): List<String> = withContext(Dispatchers.IO) {
         val numbered = lines.mapIndexed { i, t -> (i + 1).toString() + ". " + t }.joinToString("\n")
         val contextBlock = if (contextTail.isNotEmpty()) {
             "Context from the immediately preceding lines (already translated; for pronoun/tone " +
@@ -561,7 +598,7 @@ class BatchTranslator(private val http: OkHttpClient = Net.chat) {
         } else ""
 
         val messages = JSONArray().apply {
-            put(msg("system", systemPrompt(sourceLanguageEnglish)))
+            put(msg("system", systemPrompt(sourceLanguageEnglish, tone)))
             put(msg("user", contextBlock + numbered))
         }
         val payload = JSONObject().apply {
@@ -579,6 +616,7 @@ class BatchTranslator(private val http: OkHttpClient = Net.chat) {
 
         val raw = http.newCall(req).execute().use { resp ->
             val body = resp.body?.string().orEmpty()
+            if (resp.code == 429) throw RateLimitedException(body.take(200))
             if (!resp.isSuccessful) throw IOException("Chat " + resp.code + ": " + body.take(200))
             runCatching {
                 JSONObject(body).getJSONArray("choices").getJSONObject(0)
@@ -612,17 +650,42 @@ class BatchTranslator(private val http: OkHttpClient = Net.chat) {
     private fun msg(role: String, content: String) =
         JSONObject().put("role", role).put("content", content)
 
-    private fun systemPrompt(src: String) = "Translate each numbered line from " + src +
-        " into natural, fluent written Persian — full idiomatic sentences, not a literal " +
-        "word-for-word rendering. Preserve punctuation that signals tone (question marks, " +
-        "exclamation marks, ellipses). Keep names and numbers. Use the provided context only " +
-        "to keep pronouns, tone, and cross-sentence references consistent; never translate or " +
-        "renumber the context lines themselves. Reply with the SAME numbering, one translated " +
-        "line per number, nothing else — no preface, no notes. If a line has nothing " +
-        "translatable, reply for that number with a single hyphen: -"
+    /**
+     * لحن «طبیعی» (پیش‌فرض) صراحتاً از ترجمهٔ کتابی/رسمی پرهیز می‌دهد تا طنز، موزیکال و
+     * دیالوگ روزمره بی‌روح و مصنوعی درنیایند. لحن «رسمی» برای محتوای مستند/آموزشی/سخنرانی
+     * همان رفتار قبلی را حفظ می‌کند.
+     */
+    private fun systemPrompt(src: String, tone: String): String {
+        val base = "Translate each numbered line from " + src +
+            " into fluent, idiomatic Persian — full natural sentences, not a literal " +
+            "word-for-word rendering. Preserve punctuation that signals tone (question marks, " +
+            "exclamation marks, ellipses). Keep names and numbers. Use the provided context only " +
+            "to keep pronouns, tone, and cross-sentence references consistent; never translate or " +
+            "renumber the context lines themselves. Reply with the SAME numbering, one translated " +
+            "line per number, nothing else — no preface, no notes. If a line has nothing " +
+            "translatable, reply for that number with a single hyphen: -"
+
+        val styleNote = if (tone == Prefs.TONE_FORMAL) {
+            " Use formal written Persian (نوشتاری/رسمی) throughout, the register appropriate " +
+                "for documentaries, lectures, or instructional narration."
+        } else {
+            " Use everyday spoken Persian (محاوره‌ای) — the way people actually talk — instead " +
+                "of literary or textbook Persian. Match each line's emotional register and " +
+                "energy: casual banter should sound casual, jokes should land with natural " +
+                "Persian comic timing and wordplay rather than a stiff literal translation of " +
+                "the source pun, song lyrics should read rhythmically rather than as flat " +
+                "prose, and exclamations or reactions should sound like something a person " +
+                "would actually blurt out. Prefer common contractions and colloquial verb " +
+                "forms (e.g. می‌خوام instead of می‌خواهم, نمی‌دونم instead of نمی‌دانم) over " +
+                "stiff literary forms, unless a character's own dialogue is deliberately formal " +
+                "or old-fashioned."
+        }
+        return base + styleNote
+    }
 
     private companion object {
         val JSON = "application/json; charset=utf-8".toMediaType()
+        const val MAX_RETRIES = 6
     }
 }
 
@@ -1133,16 +1196,27 @@ object Bidi {
 
     private const val RLM = "\u200F"
     private const val LRI = "\u2066"
+    private const val RLI = "\u2067"
     private const val PDI = "\u2069"
 
     // یک یا چند «کلمهٔ» لاتین/عددی که با فاصله یا نویسه‌های رایج (./:@_-) به هم چسبیده‌اند،
     // به‌عنوان یک جزیرهٔ چپ‌به‌راست واحد در نظر گرفته می‌شود
     private val LATIN_RUN = Regex("[A-Za-z0-9][A-Za-z0-9 .,:/_@#&+%\\-]*[A-Za-z0-9]|[A-Za-z0-9]")
 
+    // نقطه/کاما/علامت سؤال و مانند آن‌ها که مستقیم به یک کلمهٔ فارسی چسبیده‌اند (نه به یک
+    // رشتهٔ لاتین/عدد که بالا جدا پردازش شد) نویسهٔ «خنثی» به‌حساب می‌آیند. خیلی از
+    // نمایش‌دهنده‌های زیرنویس (به‌خصوص پخش‌کننده‌های ساده‌تر موبایل) الگوریتم دوجهتهٔ
+    // یونیکد را کامل پیاده نمی‌کنند و همین‌ها را در سمت اشتباه (ابتدای جمله، به‌جای انتهای
+    // آن) نمایش می‌دهند — همان چیزی که باعث می‌شد نقطه سر جمله بیفتد. اینجا با یک ایزولهٔ
+    // راست‌به‌چپ صریح دور این نویسه‌ها، جهتشان را قطعی می‌کنیم تا همیشه در انتهای جمله
+    // (سمت چپ صفحه برای متن راست‌به‌چپ) بمانند.
+    private val NEUTRAL_PUNCT = Regex("(?<![A-Za-z0-9])[.!?…,;:]+(?![A-Za-z0-9])")
+
     fun forRtlDisplay(text: String): String {
         if (text.isBlank()) return text
-        val isolated = LATIN_RUN.replace(text) { m -> LRI + m.value + PDI }
-        return RLM + isolated
+        val latinIsolated = LATIN_RUN.replace(text) { m -> LRI + m.value + PDI }
+        val fullyIsolated = NEUTRAL_PUNCT.replace(latinIsolated) { m -> RLI + m.value + PDI }
+        return RLM + fullyIsolated
     }
 }
 
@@ -1296,9 +1370,13 @@ class ProcessingService : Service() {
             )
             val langEnglish = langOf(language).english
             val translated = ArrayList<TranslatedLine>()
-            val batchSize = 15
+            // اندازهٔ دسته بزرگ‌تر شده (۱۵ → ۲۸) تا برای فایل‌های طولانی (مثلاً ۵۹۹ خط)
+            // تعداد کل درخواست‌های /chat/completions کمتر بشه و دیرتر به سقف نرخ گروک برسیم.
+            val batchSize = 28
             val contextTail = ArrayDeque<String>()
             var i = 0
+            var batchIndex = 0
+            val totalBatches = (lines.size + batchSize - 1) / batchSize.coerceAtLeast(1)
             while (i < lines.size) {
                 val batch = lines.subList(i, minOf(i + batchSize, lines.size))
                 stage(
@@ -1306,13 +1384,20 @@ class ProcessingService : Service() {
                     0.66f + 0.28f * (i.toFloat() / lines.size.coerceAtLeast(1)),
                 )
                 val texts = batch.map { TextClean.normalize(it.sourceText) }
-                val out = translator.translateBatch(texts, langEnglish, chatCfg, contextTail.toList())
+                val out = translator.translateBatch(
+                    texts, langEnglish, chatCfg, contextTail.toList(), prefs.translationTone,
+                )
                 batch.forEachIndexed { j, line ->
                     translated.add(TranslatedLine(line.startMs, line.endMs, out.getOrElse(j) { "" }))
                 }
                 out.forEach { contextTail.addLast(it) }
                 while (contextTail.size > 6) contextTail.removeFirst()
                 i += batchSize
+                batchIndex++
+                // فاصلهٔ کنترل‌شده بین درخواست‌های ترجمه، هم‌خانواده با تأخیر بین تکه‌های STT،
+                // تا فشار روی سقف دقیقه‌ای (RPM) کمتر بشه؛ در کنار retry با backoff داخل
+                // BatchTranslator، این باعث می‌شه فایل‌های خیلی طولانی هم بدون توقف کامل شوند.
+                if (batchIndex < totalBatches) delay(2_500)
             }
 
             stage("ساخت فایل SRT…", 0.96f)
@@ -1449,6 +1534,12 @@ import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import java.io.File
+
+/** گزینه‌های لحن ترجمه برای Picker: (مقدار ذخیره‌شده در Prefs، برچسب فارسی). */
+private val TONE_OPTIONS = listOf(
+    Prefs.TONE_NATURAL to "طبیعی/محاوره‌ای (پیش‌فرض)",
+    Prefs.TONE_FORMAL to "رسمی/کتابی",
+)
 
 class MainActivity : ComponentActivity() {
 
@@ -1601,6 +1692,7 @@ class MainActivity : ComponentActivity() {
         var sttModel by remember { mutableStateOf(prefs.sttModel) }
         var chatModel by remember { mutableStateOf(prefs.chatModel) }
         var lang by remember { mutableStateOf(prefs.sourceLang) }
+        var tone by remember { mutableStateOf(prefs.translationTone) }
         var prompt by remember { mutableStateOf(promptValue) }
         var advanced by remember { mutableStateOf(false) }
 
@@ -1648,6 +1740,23 @@ class MainActivity : ComponentActivity() {
                 options = LANGS.map { it.fa },
                 selectedIndex = LANGS.indexOfFirst { it.code == lang }.coerceAtLeast(0),
                 onSelect = { i -> lang = LANGS[i].code; prefs.sourceLang = lang },
+            )
+
+            Section("لحن ترجمه")
+            Picker(
+                label = "لحن",
+                options = TONE_OPTIONS.map { it.second },
+                selectedIndex = TONE_OPTIONS.indexOfFirst { it.first == tone }.coerceAtLeast(0),
+                onSelect = { i -> tone = TONE_OPTIONS[i].first; prefs.translationTone = tone },
+            )
+            Text(
+                if (tone == Prefs.TONE_FORMAL) {
+                    "مناسب مستند، سخنرانی و محتوای آموزشی."
+                } else {
+                    "مناسب طنز، موزیکال و دیالوگ روزمره — از ترجمهٔ کتابی و خشک پرهیز می‌کند."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
 
             OutlinedTextField(
